@@ -83,10 +83,11 @@ ENTRY_LOC_BUFFER_PCT      = 0.003       # 0.3% above snap price; ignored if MOC
 EXIT_ORDER_TYPE           = "MOC"       # keep exits as MOC — non-execution risk too high
 
 # ── Data sources ────────────────────────────────────────────────────────────────
-TWELVEDATA_API_KEY          = "YOUR_KEY_HERE"
-TWELVEDATA_INCREMENTAL_DAYS = 5             # normal nightly lookback
-TWELVEDATA_HISTORY_DAYS     = 550           # full history depth for new symbols (~252 bars + buffer)
-UNIVERSE_CSV                = str(_BASE / "state" / "universe.csv")
+TWELVEDATA_API_KEY            = "YOUR_KEY_HERE"
+TWELVEDATA_INCREMENTAL_DAYS   = 5           # normal nightly lookback
+TWELVEDATA_HISTORY_DAYS       = 550         # full history depth for new symbols (~252 bars + buffer)
+TWELVEDATA_RATE_LIMIT_PER_MIN = 8           # max requests per minute (free tier = 8)
+UNIVERSE_CSV                  = str(_BASE / "state" / "universe.csv")
 
 # ── Database ────────────────────────────────────────────────────────────────────
 DB_DRIVER                 = "sqlite"    # "sqlite" | "postgresql"

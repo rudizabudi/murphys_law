@@ -12,7 +12,8 @@ import pytest
 
 import ib_data
 from ib_data import (
-    _MAX_CONCURRENT,
+    _BATCH_SIZE,
+    _INTER_BATCH_SLEEP,
     _SNAP_TIMEOUT,
     _TICK_HIGH,
     _TICK_LAST,
@@ -247,14 +248,11 @@ class TestFetchSnapshot:
         """A symbol that times out is absent; others still return data."""
         monkeypatch.setattr(ib_data, "_SNAP_TIMEOUT", 0.05)
         bridge = _make_bridge()
-        responded = {"MSFT": False}
 
         def _side(req_id, contract, generic, snap, reg, opts):
             if contract.symbol == "MSFT":
-                # Respond immediately
                 bridge.tickPrice(req_id, _TICK_LAST, 300.0, None)
                 bridge.tickSnapshotEnd(req_id)
-                responded["MSFT"] = True
             # AAPL: do nothing → timeout
 
         bridge.reqMktData.side_effect = _side
@@ -298,3 +296,95 @@ class TestFetchSnapshot:
         bridge.reqMktData.side_effect = _side
         result = fetch_snapshot(symbols, bridge)
         assert len(result) == 10
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestBatching
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBatching:
+
+    def test_single_batch_no_sleep(self, monkeypatch):
+        """Fewer than _BATCH_SIZE symbols → time.sleep never called."""
+        sleep_calls = []
+        monkeypatch.setattr(ib_data.time, "sleep", lambda s: sleep_calls.append(s))
+
+        bridge = _make_bridge()
+        symbols = [f"S{i}" for i in range(_BATCH_SIZE - 1)]
+
+        def _side(req_id, contract, generic, snap, reg, opts):
+            bridge.tickPrice(req_id, _TICK_LAST, 100.0, None)
+            bridge.tickSnapshotEnd(req_id)
+
+        bridge.reqMktData.side_effect = _side
+        fetch_snapshot(symbols, bridge)
+        assert sleep_calls == []
+
+    def test_two_batches_one_sleep(self, monkeypatch):
+        """_BATCH_SIZE + 1 symbols → exactly one sleep between the two batches."""
+        sleep_calls = []
+        monkeypatch.setattr(ib_data.time, "sleep", lambda s: sleep_calls.append(s))
+
+        bridge = _make_bridge()
+        symbols = [f"S{i:03d}" for i in range(_BATCH_SIZE + 1)]
+
+        def _side(req_id, contract, generic, snap, reg, opts):
+            bridge.tickPrice(req_id, _TICK_LAST, 100.0, None)
+            bridge.tickSnapshotEnd(req_id)
+
+        bridge.reqMktData.side_effect = _side
+        fetch_snapshot(symbols, bridge)
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == _INTER_BATCH_SLEEP
+
+    def test_three_batches_two_sleeps(self, monkeypatch):
+        """2 * _BATCH_SIZE + 1 symbols → two sleeps."""
+        sleep_calls = []
+        monkeypatch.setattr(ib_data.time, "sleep", lambda s: sleep_calls.append(s))
+
+        bridge = _make_bridge()
+        symbols = [f"S{i:03d}" for i in range(2 * _BATCH_SIZE + 1)]
+
+        def _side(req_id, contract, generic, snap, reg, opts):
+            bridge.tickPrice(req_id, _TICK_LAST, 100.0, None)
+            bridge.tickSnapshotEnd(req_id)
+
+        bridge.reqMktData.side_effect = _side
+        fetch_snapshot(symbols, bridge)
+        assert len(sleep_calls) == 2
+
+    def test_all_symbols_returned_across_batches(self, monkeypatch):
+        """All symbols across multiple batches are present in the result."""
+        monkeypatch.setattr(ib_data.time, "sleep", lambda s: None)
+
+        bridge = _make_bridge()
+        symbols = [f"S{i:03d}" for i in range(_BATCH_SIZE + 5)]
+
+        def _side(req_id, contract, generic, snap, reg, opts):
+            bridge.tickPrice(req_id, _TICK_LAST, 100.0, None)
+            bridge.tickSnapshotEnd(req_id)
+
+        bridge.reqMktData.side_effect = _side
+        result = fetch_snapshot(symbols, bridge)
+        assert len(result) == len(symbols)
+
+    def test_timeout_in_second_batch_excluded(self, monkeypatch):
+        """A timeout in the second batch excludes only that symbol."""
+        monkeypatch.setattr(ib_data, "_SNAP_TIMEOUT", 0.05)
+        monkeypatch.setattr(ib_data.time, "sleep", lambda s: None)
+
+        bridge = _make_bridge()
+        # Fill first batch fully; make last symbol in second batch time out
+        symbols = [f"S{i:03d}" for i in range(_BATCH_SIZE + 1)]
+        timeout_sym = symbols[-1]
+
+        def _side(req_id, contract, generic, snap, reg, opts):
+            if contract.symbol == timeout_sym:
+                return   # no response → timeout
+            bridge.tickPrice(req_id, _TICK_LAST, 100.0, None)
+            bridge.tickSnapshotEnd(req_id)
+
+        bridge.reqMktData.side_effect = _side
+        result = fetch_snapshot(symbols, bridge)
+        assert timeout_sym not in result
+        assert len(result) == _BATCH_SIZE

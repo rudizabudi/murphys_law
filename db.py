@@ -127,6 +127,10 @@ _TABLES = [
         actual_risk_frac  REAL,
         consec_lows       INTEGER NOT NULL DEFAULT 0,
         ib_order_id       INTEGER,
+        order_type        TEXT,
+        limit_price       REAL,
+        qpi_at_entry      REAL,
+        ibs_at_entry      REAL,
         created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """,
@@ -165,6 +169,16 @@ _TABLES = [
 ]
 
 
+# Additive migrations — each is a no-op if the column already exists.
+# Catching the exception is necessary for SQLite < 3.37 (no ADD COLUMN IF NOT EXISTS).
+_MIGRATIONS = [
+    "ALTER TABLE positions ADD COLUMN order_type   TEXT",
+    "ALTER TABLE positions ADD COLUMN limit_price  REAL",
+    "ALTER TABLE positions ADD COLUMN qpi_at_entry REAL",
+    "ALTER TABLE positions ADD COLUMN ibs_at_entry REAL",
+]
+
+
 def init_db() -> None:
     """
     Create all tables if they do not exist. Safe to call multiple times.
@@ -175,6 +189,11 @@ def init_db() -> None:
         cur = conn.cursor()
         for ddl in _TABLES:
             cur.execute(ddl)
+        for stmt in _MIGRATIONS:
+            try:
+                cur.execute(stmt)
+            except Exception:
+                pass  # column already exists
         conn.commit()
     finally:
         conn.close()

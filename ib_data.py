@@ -6,7 +6,10 @@ Public API
   fetch_snapshot(symbols, bridge) → dict[str, dict]
 
 Calls reqMktData(snapshot=True) for each symbol via the provided IBBridge.
-Up to _MAX_CONCURRENT requests are in flight simultaneously (threading.Semaphore).
+Symbols are processed in batches of _BATCH_SIZE with _INTER_BATCH_SLEEP seconds
+between successive batches to avoid flooding the IB gateway.  Within each batch,
+all requests are in-flight simultaneously via daemon threads.
+
 Returns {symbol: {"open": float, "high": float, "low": float,
                   "close": float, "volume": int}}.
 
@@ -24,25 +27,26 @@ import contextlib
 import logging
 import queue
 import threading
+import time
 from typing import Any
 
 from ibapi.contract import Contract
 
-import config
 from ib_exec import IBBridge, _SENTINEL
 
 logger = logging.getLogger("murphy")
 
-_MAX_CONCURRENT = 50    # max simultaneous reqMktData calls in flight
-_SNAP_TIMEOUT   = 10    # seconds to wait for tickSnapshotEnd per symbol
+_BATCH_SIZE        = 50    # symbols processed per batch (concurrently within each batch)
+_INTER_BATCH_SLEEP = 1.0   # seconds to sleep between successive batches
+_SNAP_TIMEOUT      = 10    # seconds to wait for tickSnapshotEnd per symbol
 
 # IB tick-type constants used for intraday snapshot data
-_TICK_OPEN    = 14   # tickPrice: today's open
-_TICK_HIGH    = 6    # tickPrice: today's high
-_TICK_LOW     = 7    # tickPrice: today's low
-_TICK_LAST    = 4    # tickPrice: last trade price (close proxy)
-_TICK_PREV_CLOSE = 9 # tickPrice: previous session's close (fallback if no LAST)
-_TICK_VOLUME  = 8    # tickSize:  cumulative volume
+_TICK_OPEN       = 14   # tickPrice: today's open
+_TICK_HIGH       = 6    # tickPrice: today's high
+_TICK_LOW        = 7    # tickPrice: today's low
+_TICK_LAST       = 4    # tickPrice: last trade price (close proxy)
+_TICK_PREV_CLOSE = 9    # tickPrice: previous session's close (fallback if no LAST)
+_TICK_VOLUME     = 8    # tickSize:  cumulative volume
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -104,8 +108,9 @@ def fetch_snapshot(
     """
     Fetch today's intraday snapshot for each symbol via reqMktData(snapshot=True).
 
-    Up to _MAX_CONCURRENT requests are active simultaneously.  Each request
-    waits up to _SNAP_TIMEOUT seconds for tickSnapshotEnd before giving up.
+    Symbols are processed in batches of _BATCH_SIZE.  Within each batch all
+    requests run concurrently (one daemon thread per symbol).  _INTER_BATCH_SLEEP
+    seconds are inserted between successive batches.
 
     Returns
     -------
@@ -120,7 +125,11 @@ def fetch_snapshot(
 
     results: dict[str, dict] = {}
     results_lock = threading.Lock()
-    sem = threading.Semaphore(_MAX_CONCURRENT)
+
+    batches = [
+        symbols[i: i + _BATCH_SIZE]
+        for i in range(0, len(symbols), _BATCH_SIZE)
+    ]
 
     with _snapshot_callbacks(bridge) as (snap_queues, queues_lock):
 
@@ -162,7 +171,6 @@ def fetch_snapshot(
                         elif tick_type == _TICK_LAST:
                             snap["close"] = val
                         elif tick_type == _TICK_PREV_CLOSE and snap["close"] == 0.0:
-                            # Use previous close as fallback only if LAST not seen yet
                             snap["close"] = val
                     elif kind == "S" and tick_type == _TICK_VOLUME:
                         snap["volume"] = val
@@ -177,23 +185,26 @@ def fetch_snapshot(
                 else:
                     logger.warning("[ib_data] no usable close price for %s — excluded", sym)
 
-            finally:
-                sem.release()
+            except Exception as exc:
+                logger.warning("[ib_data] error fetching snapshot for %s: %s", sym, exc)
 
-        threads: list[threading.Thread] = []
-        for sym in symbols:
-            sem.acquire()
-            t = threading.Thread(
-                target=_fetch_one,
-                args=(sym,),
-                daemon=True,
-                name=f"ib-snap-{sym}",
-            )
-            threads.append(t)
-            t.start()
+        for idx, batch in enumerate(batches):
+            if idx > 0:
+                time.sleep(_INTER_BATCH_SLEEP)
 
-        for t in threads:
-            t.join()
+            threads = [
+                threading.Thread(
+                    target=_fetch_one,
+                    args=(sym,),
+                    daemon=True,
+                    name=f"ib-snap-{sym}",
+                )
+                for sym in batch
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
     logger.info(
         "[ib_data] fetch_snapshot: %d/%d symbol(s) returned usable data",

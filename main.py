@@ -35,6 +35,8 @@ import order_manager
 import portfolio_state
 import risk_engine
 import signals
+import ib_data
+import td_data
 import universe
 from ib_exec import (
     IBBridge, IBCController, OrderRejectedError,
@@ -69,57 +71,6 @@ def _load_universe() -> list[str]:
                 symbols.append(row[0].strip())
     logger.info("[main] Universe: %d symbols loaded from %s", len(symbols), path)
     return symbols
-
-
-def _fetch_twelvedata_bars(
-    symbol: str,
-    api_key: str,
-    outputsize: int | None = None,
-) -> list[dict] | None:
-    """
-    Request the last *outputsize* daily bars from TwelveData for one symbol.
-    Defaults to config.TWELVEDATA_INCREMENTAL_DAYS when outputsize is None.
-    Returns a list of OHLCV dicts, or None on error.
-    """
-    try:
-        import httpx
-    except ImportError:
-        logger.error("[main] httpx not installed — cannot fetch TwelveData bars")
-        return None
-
-    if outputsize is None:
-        outputsize = config.TWELVEDATA_INCREMENTAL_DAYS
-
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol":       symbol,
-        "interval":     "1day",
-        "outputsize":   outputsize,
-        "apikey":       api_key,
-        "format":       "JSON",
-    }
-    try:
-        resp = httpx.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") == "error" or "values" not in body:
-            logger.warning("[main] TwelveData error for %s: %s", symbol, body.get("message", body))
-            return None
-        rows = []
-        for bar in body["values"]:
-            rows.append({
-                "symbol": symbol,
-                "date":   bar["datetime"],
-                "open":   float(bar["open"]),
-                "high":   float(bar["high"]),
-                "low":    float(bar["low"]),
-                "close":  float(bar["close"]),
-                "volume": float(bar["volume"]),
-            })
-        return rows
-    except Exception as exc:
-        logger.error("[main] TwelveData fetch failed for %s: %s", symbol, exc)
-        return None
 
 
 def _load_history_from_db(symbol: str) -> pd.DataFrame | None:
@@ -157,55 +108,8 @@ def _load_watchlist_from_db() -> list[str]:
 
 
 def _fetch_ib_snapshot(symbols: list[str]) -> dict[str, dict]:
-    """
-    Fetch today's intraday partial bar from IB for each symbol via reqMktData
-    (snapshot=True).  Returns {symbol: {open, high, low, close, volume}}.
-
-    This is a simplified implementation: in production each reqMktData call
-    fires asynchronously via individual queues; here we call it sequentially.
-    Any symbol that fails is silently excluded (data is optional — missing
-    symbols fall back to yesterday's DB close for indicator computation).
-    """
-    # Lazy import — ib_exec already imports ibapi; this avoids circular issues.
-    from ibapi.contract import Contract
-
-    results: dict[str, dict] = {}
-    for sym in symbols:
-        try:
-            contract = Contract()
-            contract.symbol   = sym
-            contract.secType  = "STK"
-            contract.exchange = "SMART"
-            contract.currency = "USD"
-
-            # reqMktData snapshot returns via tickPrice / tickSize callbacks.
-            # A full async implementation lives in ib_exec; here we rely on
-            # the bridge having registered appropriate callbacks.  For v1 we
-            # use reqMktData with a short wait — this will be replaced by a
-            # proper async implementation in a follow-up sprint.
-            q: "queue.Queue" = __import__("queue").Queue()
-
-            def _on_snap(reqId, field, price, attrib):
-                if field == 4 and price > 0:   # LAST price
-                    q.put(("last", price))
-
-            bridge.tickPrice = _on_snap
-            req_id = bridge._get_next_order_id()
-            bridge.reqMktData(req_id, contract, "", True, False, [])
-            try:
-                _, last = q.get(timeout=5)
-                results[sym] = {
-                    "open":   last,
-                    "high":   last,
-                    "low":    last,
-                    "close":  last,
-                    "volume": 0,
-                }
-            except __import__("queue").Empty:
-                logger.debug("[main] snapshot timeout for %s", sym)
-        except Exception as exc:
-            logger.debug("[main] snapshot error for %s: %s", sym, exc)
-    return results
+    """Delegate to ib_data.fetch_snapshot — see ib_data.py for full docs."""
+    return ib_data.fetch_snapshot(symbols, bridge)
 
 
 def _merge_today_bar(
@@ -277,13 +181,15 @@ def _consec_loss_stats() -> tuple[int, int]:
 
 def _reconcile_with_ib(
     positions: list[dict],
-    filled: dict[int, dict],
+    ib_positions: list[dict],
 ) -> tuple[bool, str]:
     """
-    Compare DB open positions against IB filled orders.
+    Compare DB open position symbols against the full IB position report.
+    Using the live IB position list catches pre-existing discrepancies from
+    prior sessions, not just today's fills.
     Returns (mismatch: bool, detail: str).
     """
-    ib_syms  = {v["symbol"] for v in filled.values() if v.get("status") == "Filled"}
+    ib_syms  = {p["symbol"] for p in ib_positions}
     db_syms  = {p["symbol"] for p in positions}
     extra_ib = ib_syms - db_syms
     extra_db = db_syms - ib_syms
@@ -326,11 +232,10 @@ def nightly_sync() -> None:
         return
 
     db.init_db()
-    api_key = config.TWELVEDATA_API_KEY
     total_upserted = 0
 
     for sym in symbols:
-        rows = _fetch_twelvedata_bars(sym, api_key)
+        rows = td_data.fetch_bars(sym, config.TWELVEDATA_INCREMENTAL_DAYS)
         if rows:
             n = db.upsert_daily_bars(rows)
             total_upserted += n
@@ -344,7 +249,7 @@ def nightly_sync() -> None:
         logger.info("[main] nightly_sync: %d symbol(s) still need full history", len(new_syms))
         history_upserted = 0
         for sym in new_syms:
-            rows = _fetch_twelvedata_bars(sym, api_key, outputsize=config.TWELVEDATA_HISTORY_DAYS)
+            rows = td_data.fetch_bars(sym, config.TWELVEDATA_HISTORY_DAYS)
             if rows:
                 history_upserted += db.upsert_daily_bars(rows)
         logger.info("[main] nightly_sync: full-history upserted %d rows for %d symbol(s)",
@@ -590,9 +495,13 @@ def order_submission() -> None:
         logger.critical("[main] order_submission: SHUTDOWN active — no orders submitted")
         return
 
-    # Daily loss
+    # Daily loss — unrealised intraday P&L across all open positions
+    daily_pnl = sum(
+        (snap_prices.get(p["symbol"], p["fill_price"]) - p["fill_price"]) * p["shares"]
+        for p in open_positions
+    )
     risk_engine.evaluate("daily_loss", {
-        "daily_pnl": 0.0,      # populated by fill_reconciliation; use 0 as placeholder
+        "daily_pnl": daily_pnl,
         "equity":    current_equity,
     })
 
@@ -658,12 +567,14 @@ def order_submission() -> None:
             try:
                 oid = submit_order(bridge, order)
                 _submitted[oid] = {
-                    "symbol":     order.symbol,
-                    "action":     order.action,
-                    "pos_id":     "",
-                    "shares":     order.quantity,
-                    "fill_price": snap_prices.get(order.symbol, 0.0),
-                    "reason":     order.reason,
+                    "symbol":      order.symbol,
+                    "action":      order.action,
+                    "pos_id":      "",
+                    "shares":      order.quantity,
+                    "fill_price":  snap_prices.get(order.symbol, 0.0),
+                    "reason":      order.reason,
+                    "order_type":  order.order_type,
+                    "limit_price": order.limit_price,
                 }
                 logger.info("[main] submitted ENTRY order id=%d %s %s qty=%d type=%s",
                             oid, order.action, order.symbol, order.quantity, order.order_type)
@@ -719,8 +630,9 @@ def fill_reconciliation() -> None:
     snap_prices    = _snap_state.get("snap_prices", {})
     today          = date.today()
 
-    # ── Split detection ───────────────────────────────────────────────────────
+    # ── Split detection + fetch live IB positions for later reconciliation ────
     split_symbols: set[str] = set()
+    ib_pos: list[dict] = []
     try:
         ib_pos = get_ib_positions(bridge)
         splits = detect_splits(ib_pos, open_positions)
@@ -794,6 +706,26 @@ def fill_reconciliation() -> None:
                 "ib_order_id":      oid,
             }
             portfolio_state.save_position(pos)
+
+            # Persist entry metadata not covered by _POS_COLUMNS in portfolio_state
+            _entry_sigs_map = {s["symbol"]: s for s in _snap_state.get("entry_signals", [])}
+            _sig = _entry_sigs_map.get(sym, {})
+            _p = db.ph()
+            with db.connect() as conn:
+                conn.execute(
+                    f"UPDATE positions "
+                    f"SET order_type={_p}, limit_price={_p}, "
+                    f"qpi_at_entry={_p}, ibs_at_entry={_p} "
+                    f"WHERE pos_id={_p}",
+                    (
+                        sub.get("order_type", config.ENTRY_ORDER_TYPE),
+                        sub.get("limit_price"),
+                        _sig.get("n_day_ret"),
+                        _sig.get("ibs_entry"),
+                        pos["pos_id"],
+                    ),
+                )
+
             logger.info("[main] fill_reconciliation: saved entry %s qty=%d @ %.4f",
                         sym, fill_qty, fill_price)
 
@@ -845,7 +777,7 @@ def fill_reconciliation() -> None:
 
     # ── IB reconciliation (exclude already-handled splits) ───────────────────
     non_split_positions = [p for p in positions_now if p["symbol"] not in split_symbols]
-    mismatch, detail = _reconcile_with_ib(non_split_positions, filled)
+    mismatch, detail = _reconcile_with_ib(non_split_positions, ib_pos)
     if mismatch:
         risk_engine.evaluate("reconcile_mismatch", {"mismatch": True, "detail": detail})
         logger.warning("[main] fill_reconciliation: IB mismatch — %s", detail)
@@ -894,8 +826,20 @@ def daily_report() -> None:
                 ).fetchall()
             ]
             entries_today = [
-                dict(r) for r in conn.execute(
-                    "SELECT symbol, fill_price, shares FROM positions WHERE entry_date = ?",
+                {
+                    "symbol":      r["symbol"],
+                    "fill_price":  r["fill_price"],
+                    "shares":      r["shares"],
+                    "order_type":  r["order_type"] if r["order_type"] is not None
+                                   else config.ENTRY_ORDER_TYPE,
+                    "limit_price": r["limit_price"],   # None for MOC — handled by build_daily_report
+                    "qpi":         r["qpi_at_entry"]  if r["qpi_at_entry"]  is not None else 0.0,
+                    "ibs":         r["ibs_at_entry"]  if r["ibs_at_entry"]  is not None else 0.0,
+                }
+                for r in conn.execute(
+                    "SELECT symbol, fill_price, shares, "
+                    "order_type, limit_price, qpi_at_entry, ibs_at_entry "
+                    "FROM positions WHERE entry_date = ?",
                     (str(today),),
                 ).fetchall()
             ]
@@ -981,13 +925,12 @@ def sunday_universe_update() -> None:
     removed = result["removed"]
     total   = result["total"]
 
-    api_key          = config.TWELVEDATA_API_KEY
     history_upserted = 0
 
     if added:
         logger.info("[main] sunday_universe_update: fetching full history for %d new symbol(s)", len(added))
         for sym in added:
-            rows = _fetch_twelvedata_bars(sym, api_key, outputsize=config.TWELVEDATA_HISTORY_DAYS)
+            rows = td_data.fetch_bars(sym, config.TWELVEDATA_HISTORY_DAYS)
             if rows:
                 history_upserted += db.upsert_daily_bars(rows)
         logger.info("[main] sunday_universe_update: upserted %d bar rows for new symbols",

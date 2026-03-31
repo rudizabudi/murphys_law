@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(.venv/bin/python -m pytest tests/test_td_data.py tests/test_ib_data.py -q)",
-      "Bash(.venv/bin/python -c \"import config; print\\(config.TWELVEDATA_API_KEY, config.TWELVEDATA_INCREMENTAL_DAYS, config.TWELVEDATA_HISTORY_DAYS\\)\")"
+      "Bash(.venv/bin/python -c \"import config; print\\(config.TWELVEDATA_API_KEY, config.TWELVEDATA_INCREMENTAL_DAYS, config.TWELVEDATA_HISTORY_DAYS\\)\")",
+      "Bash(.venv/bin/python -m pytest tests/test_ib_data.py -v)",
+      "Bash(.venv/bin/python -m pytest tests/test_main.py -v)",
+      "Bash(.venv/bin/python -m pytest tests/test_td_data.py tests/test_main.py -v)"
     ]
   }
 }

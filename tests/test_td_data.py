@@ -17,6 +17,7 @@ from td_data import (
     _BATCH_SIZE,
     _fetch_batch,
     _parse_rows,
+    fetch_bars,
     fetch_full_history,
     fetch_incremental,
 )
@@ -336,3 +337,152 @@ class TestBatching:
             total = fetch_incremental(symbols, n_days=2)
 
         assert total == len(symbols) * 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestFetchBars
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFetchBars:
+
+    @pytest.fixture(autouse=True)
+    def reset_rate_limiter(self, monkeypatch):
+        """Reset module-level rate-limiter state and suppress sleep between tests."""
+        monkeypatch.setattr(td_data, "_last_request_time", 0.0)
+        monkeypatch.setattr(td_data.time, "sleep", MagicMock())
+
+    def test_returns_list_for_valid_symbol(self):
+        body = _single_sym_body("AAPL", 3)
+        with patch("httpx.get", return_value=_mock_response(body)):
+            result = fetch_bars("AAPL", n_days=3)
+        assert isinstance(result, list)
+        assert len(result) == 3
+
+    def test_all_ohlcv_fields_present(self):
+        body = _single_sym_body("AAPL", 1)
+        with patch("httpx.get", return_value=_mock_response(body)):
+            result = fetch_bars("AAPL", n_days=1)
+        row = result[0]
+        for field in ("symbol", "date", "open", "high", "low", "close", "volume"):
+            assert field in row
+
+    def test_returns_none_on_http_error(self):
+        mock = _mock_response({}, 500)
+        mock.raise_for_status.side_effect = Exception("500")
+        with patch("httpx.get", return_value=mock):
+            result = fetch_bars("AAPL", n_days=5)
+        assert result is None
+
+    def test_returns_none_when_symbol_not_in_response(self):
+        # Multi-symbol response format that contains only MSFT, not AAPL
+        body = _multi_sym_body(["MSFT"], 3)
+        with patch("httpx.get", return_value=_mock_response(body)):
+            result = fetch_bars("AAPL", n_days=3)
+        assert result is None
+
+    def test_uses_correct_n_days(self):
+        body = _single_sym_body("AAPL", 10)
+        with patch("httpx.get", return_value=_mock_response(body)) as mock_get:
+            fetch_bars("AAPL", n_days=10)
+        params = mock_get.call_args[1]["params"]
+        assert params["outputsize"] == 10
+
+    def test_symbol_field_in_rows(self):
+        body = _single_sym_body("TSLA", 2)
+        with patch("httpx.get", return_value=_mock_response(body)):
+            result = fetch_bars("TSLA", n_days=2)
+        assert all(r["symbol"] == "TSLA" for r in result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestRateLimiter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRateLimiter:
+    """
+    Verify fetch_bars() rate-limits requests to TWELVEDATA_RATE_LIMIT_PER_MIN.
+    time.time and time.sleep are both mocked for deterministic assertions.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch):
+        monkeypatch.setattr(td_data, "_last_request_time", 0.0)
+        self.sleep_calls: list[float] = []
+        monkeypatch.setattr(td_data.time, "sleep", lambda s: self.sleep_calls.append(s))
+        # Default: successful response for AAPL
+        body = _single_sym_body("AAPL", 1)
+        monkeypatch.setattr(
+            "httpx.get", lambda *a, **kw: _mock_response(body)
+        )
+
+    def test_no_sleep_when_last_request_is_old(self, monkeypatch):
+        """_last_request_time = 0.0 (epoch) → elapsed is huge → no sleep."""
+        fetch_bars("AAPL", n_days=1)
+        assert self.sleep_calls == []
+
+    def test_sleep_fires_when_under_interval(self, monkeypatch):
+        """_last_request_time = just now → elapsed < interval → sleep called."""
+        import time as _time
+        monkeypatch.setattr(td_data, "_last_request_time", _time.time())
+        fetch_bars("AAPL", n_days=1)
+        assert len(self.sleep_calls) == 1
+        assert self.sleep_calls[0] > 0
+
+    def test_sleep_duration_equals_remaining_interval(self, monkeypatch):
+        """Sleep amount = min_interval - elapsed."""
+        fake_now    = 1_000.0
+        last_req    = 999.0          # 1 second ago
+        monkeypatch.setattr(td_data, "_last_request_time", last_req)
+        monkeypatch.setattr(td_data.time, "time", lambda: fake_now)
+
+        fetch_bars("AAPL", n_days=1)
+
+        min_interval   = 60.0 / config.TWELVEDATA_RATE_LIMIT_PER_MIN
+        expected_sleep = min_interval - (fake_now - last_req)
+        assert self.sleep_calls == [pytest.approx(expected_sleep)]
+
+    def test_no_sleep_when_exactly_at_interval(self, monkeypatch):
+        """Elapsed == min_interval exactly → no sleep."""
+        min_interval = 60.0 / config.TWELVEDATA_RATE_LIMIT_PER_MIN
+        fake_now     = 1_000.0
+        last_req     = fake_now - min_interval   # exactly the interval ago
+        monkeypatch.setattr(td_data, "_last_request_time", last_req)
+        monkeypatch.setattr(td_data.time, "time", lambda: fake_now)
+
+        fetch_bars("AAPL", n_days=1)
+
+        assert self.sleep_calls == []
+
+    def test_respects_custom_rate_limit(self, monkeypatch):
+        """Doubling RATE_LIMIT_PER_MIN halves the interval → sleep is shorter."""
+        monkeypatch.setattr(config, "TWELVEDATA_RATE_LIMIT_PER_MIN", 16)
+        fake_now = 1_000.0
+        last_req = 999.0
+        monkeypatch.setattr(td_data, "_last_request_time", last_req)
+        monkeypatch.setattr(td_data.time, "time", lambda: fake_now)
+
+        fetch_bars("AAPL", n_days=1)
+
+        min_interval   = 60.0 / 16
+        expected_sleep = min_interval - (fake_now - last_req)
+        assert self.sleep_calls == [pytest.approx(expected_sleep)]
+
+    def test_last_request_time_updated_after_call(self, monkeypatch):
+        """_last_request_time is updated so subsequent calls can enforce the limit."""
+        fetch_bars("AAPL", n_days=1)
+        assert td_data._last_request_time > 0.0
+
+    def test_sleep_not_called_for_batch_functions(self, monkeypatch):
+        """fetch_incremental uses _fetch_batch directly — rate limiter does not fire."""
+        import time as _time
+        # Set _last_request_time to just now, so fetch_bars would sleep
+        monkeypatch.setattr(td_data, "_last_request_time", _time.time())
+
+        body = _single_sym_body("AAPL", 1)
+        with patch("httpx.get", return_value=_mock_response(body)):
+            # fetch_incremental does NOT go through fetch_bars
+            fetch_incremental(["AAPL"], n_days=1)
+
+        # The rate-limiter sleep must not have fired (only _INTER_BATCH_DELAY, which
+        # is not triggered for a single batch)
+        assert self.sleep_calls == []

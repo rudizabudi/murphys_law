@@ -3,18 +3,18 @@ td_data.py — TwelveData daily bar integration.
 
 Public API
 ──────────
+  fetch_bars(symbol, n_days)               → list[dict] | None  single-symbol fetch
   fetch_incremental(symbols, n_days=None)  → int   last N days for each symbol
   fetch_full_history(symbols, n_days=None) → int   full history for new symbols
 
-Both functions upsert results into daily_bars via db.upsert_daily_bars() and
-return the total number of rows upserted.
+fetch_bars() is rate-limited to config.TWELVEDATA_RATE_LIMIT_PER_MIN requests
+per minute (default 8, matching the free-tier cap of 8 req/min).  A sleep is
+inserted only when the time since the last request is less than the required
+interval — no unnecessary sleeping when the fetch itself takes longer.
 
-Rate limiting
-─────────────
-Symbols are grouped into batches of _BATCH_SIZE (55) and sent in a single HTTP
-request.  _INTER_BATCH_DELAY seconds are inserted between successive requests.
-55 × INCREMENTAL(5) = 275 credits/batch, well within paid-plan limits; for the
-free plan (8 credits/min) only small universes are practical.
+fetch_incremental() and fetch_full_history() batch multiple symbols into a
+single HTTP request (_BATCH_SIZE = 55) and use _INTER_BATCH_DELAY between
+successive batches; they are intended for use when the account has a paid plan.
 
 TwelveData response format
 ──────────────────────────
@@ -36,6 +36,9 @@ logger = logging.getLogger("murphy")
 _TD_BASE_URL        = "https://api.twelvedata.com/time_series"
 _BATCH_SIZE         = 55     # symbols per HTTP request
 _INTER_BATCH_DELAY  = 0.5    # seconds between successive batch requests
+
+# Rate-limiter state for fetch_bars() (single-symbol path)
+_last_request_time: float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -163,6 +166,33 @@ def _fetch_and_upsert(symbols: list[str], outputsize: int) -> int:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Public API
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def fetch_bars(symbol: str, n_days: int) -> list[dict] | None:
+    """
+    Fetch the last *n_days* daily bars for a single symbol from TwelveData.
+
+    Applies a rate limit of config.TWELVEDATA_RATE_LIMIT_PER_MIN requests per
+    minute.  A sleep is inserted only when the elapsed time since the previous
+    request is less than the required interval.
+
+    Returns a list of OHLCV dicts (keys: symbol, date, open, high, low, close,
+    volume) ready for db.upsert_daily_bars(), or None on any error.
+    """
+    global _last_request_time
+
+    min_interval = 60.0 / config.TWELVEDATA_RATE_LIMIT_PER_MIN
+    elapsed = time.time() - _last_request_time
+    if elapsed < min_interval:
+        time.sleep(min_interval - elapsed)
+
+    fetched = _fetch_batch([symbol], outputsize=n_days)
+    _last_request_time = time.time()
+
+    if symbol not in fetched:
+        return None
+    rows = _parse_rows(symbol, fetched[symbol])
+    return rows if rows else None
+
 
 def fetch_incremental(
     symbols: list[str],
