@@ -174,8 +174,17 @@ murphy_law/
 ├── reference/
 │   └── v300.py             # Backtest source — reference for parity checks
 └── tests/
-    ├── test_indicators.py  # Parity checks against backtest outputs
-    └── test_sizing.py
+    ├── test_indicators.py      # Parity checks against backtest outputs
+    ├── test_monitor.py
+    ├── test_risk_engine.py
+    ├── test_signals.py
+    ├── test_portfolio_state.py
+    ├── test_ib_exec.py
+    ├── test_order_manager.py
+    ├── test_td_data.py
+    ├── test_ib_data.py
+    ├── test_main.py
+    └── test_universe.py
 ```
 
 ---
@@ -306,7 +315,7 @@ EXIT_ORDER_TYPE           = "MOC"       # Keep exits as MOC — non-execution ri
 TWELVEDATA_API_KEY            = "YOUR_KEY_HERE"
 TWELVEDATA_INCREMENTAL_DAYS   = 5           # Normal nightly lookback (fetch_bars per-symbol path)
 TWELVEDATA_HISTORY_DAYS       = 550         # Full history depth for new symbols (~252 bars + buffer)
-TWELVEDATA_RATE_LIMIT_PER_MIN = 8           # Max requests per minute (free tier = 8); enforced in fetch_bars()
+TWELVEDATA_RATE_LIMIT_PER_MIN = 8           # Free tier: 8 credits/min. Paid plans support higher limits. Each symbol in a batch = 1 credit.
 UNIVERSE_CSV                  = "state/universe.csv"
 
 # ── Database ────────────────────────────────────────────────────────────────────
@@ -445,7 +454,7 @@ python migrate.py
 
 #### 4.2.3 Nightly TwelveData Sync (~20:00 ET)
 
-**File:** `ib_data.py` (TwelveData section)
+**File:** `td_data.py`
 
 For each symbol in `universe.csv`, request the last few days of daily bars from TwelveData and upsert into `daily_bars`. After the DB update, trigger `precompute_watchlist()`.
 
@@ -594,6 +603,10 @@ CREATE TABLE IF NOT EXISTS positions (
     actual_risk_frac  REAL,
     consec_lows       INTEGER NOT NULL DEFAULT 0,
     ib_order_id       INTEGER,
+    order_type        TEXT,
+    limit_price       REAL,
+    qpi_at_entry      REAL,
+    ibs_at_entry      REAL,
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
