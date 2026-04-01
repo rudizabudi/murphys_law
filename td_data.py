@@ -35,7 +35,9 @@ logger = logging.getLogger("murphy")
 
 _TD_BASE_URL        = "https://api.twelvedata.com/time_series"
 _BATCH_SIZE         = 55     # symbols per HTTP request
-_INTER_BATCH_DELAY  = 0.5    # seconds between successive batch requests
+# Each symbol in a batch consumes one API credit; delay ensures the per-minute
+# credit consumption stays within TWELVEDATA_RATE_LIMIT_PER_MIN.
+_INTER_BATCH_DELAY  = (_BATCH_SIZE / config.TWELVEDATA_RATE_LIMIT_PER_MIN) * 60
 
 # Rate-limiter state for fetch_bars() (single-symbol path)
 _last_request_time: float = 0.0

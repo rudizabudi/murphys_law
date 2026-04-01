@@ -24,7 +24,7 @@ from ib_data import (
     _snapshot_callbacks,
     fetch_snapshot,
 )
-from ib_exec import _SENTINEL
+from ib_exec import SENTINEL
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ class _FakeBridge:
         self.cancelMktData = MagicMock()
         self.__dict__      # ensure instance __dict__ is accessible
 
-    def _get_next_order_id(self) -> int:
+    def get_next_order_id(self) -> int:
         with self._lock:
             oid = self._next_order_id
             self._next_order_id += 1
@@ -125,7 +125,7 @@ class TestSnapshotCallbacks:
             q = queue.Queue()
             snap_queues[3] = q
             bridge.tickSnapshotEnd(3)
-        assert q.get_nowait() is _SENTINEL
+        assert q.get_nowait() is SENTINEL
 
     def test_unknown_reqId_ignored(self):
         bridge = _make_bridge()

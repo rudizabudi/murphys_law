@@ -32,7 +32,7 @@ from typing import Any
 
 from ibapi.contract import Contract
 
-from ib_exec import IBBridge, _SENTINEL
+from ib_exec import IBBridge, SENTINEL
 
 logger = logging.getLogger("murphy")
 
@@ -84,7 +84,7 @@ def _snapshot_callbacks(bridge: IBBridge):
         with queues_lock:
             q = snap_queues.get(reqId)
         if q is not None:
-            q.put(_SENTINEL)
+            q.put(SENTINEL)
 
     bridge.tickPrice       = _tick_price
     bridge.tickSize        = _tick_size
@@ -135,7 +135,7 @@ def fetch_snapshot(
 
         def _fetch_one(sym: str) -> None:
             try:
-                req_id = bridge._get_next_order_id()
+                req_id = bridge.get_next_order_id()
                 q: queue.Queue = queue.Queue()
                 with queues_lock:
                     snap_queues[req_id] = q
@@ -158,7 +158,7 @@ def fetch_snapshot(
                             "[ib_data] snapshot timeout for %s (reqId=%d)", sym, req_id
                         )
                         break
-                    if item is _SENTINEL:
+                    if item is SENTINEL:
                         break
                     kind, tick_type, val = item
                     if kind == "P":

@@ -246,11 +246,30 @@ LIQUIDITY_ADV_WINDOW      = 63
 LIQUIDITY_ADV_MAX_PCT     = 0.05
 ROUND_TRIP_COST_BPS       = 2.0
 
+# ── Data integrity (used by migrate.py — must match backtest values) ───────────
+SPLIT_DROP_THRESHOLD      = -0.50       # Single-bar close drop flagging a likely split
+CRASH_QUORUM_DROP         = 0.15        # Per-symbol drop threshold for crash detection
+CRASH_QUORUM_FRACTION     = 0.30        # Fraction of universe dropping to call a crash day
+
+# Minimum daily bars per symbol before it can enter daily_bars (partial warmup ok)
+MIN_BARS_REQUIRED: int = (
+    max(SMA_PERIOD, RETURN_RANK_RANGE // 4, LIQUIDITY_ADV_WINDOW)
+    + ENTRY_N_DAY_RETURN + 30
+)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+DATA_DIR                  = "data/"     # Input for migrate.py only; never read after migration
+
 # ── IB Connection ───────────────────────────────────────────────────────────────
 IB_HOST                   = "127.0.0.1"
 IB_PORT                   = 7496        # 7497 for paper trading
 IB_CLIENT_ID              = 1
 IB_SUBACCOUNT             = ""          # Subaccount ID (e.g. "DU1234567"); empty = use master account
+IB_HEARTBEAT_TIMEOUT_SEC  = 5           # Seconds to wait for reqCurrentTime response in heartbeat()
+
+# ── IB error codes ──────────────────────────────────────────────────────────────
+IB_SOFT_ERROR_CODES       = [2104, 2106, 2107, 2108, 2158]   # Informational; logged at DEBUG, never stored
+IB_REJECTION_CODES        = [201, 202, 203, 321, 322]         # Hard order rejections; raise OrderRejectedError
 
 # ── IBC (automated TWS/Gateway login) ──────────────────────────────────────────
 IBC_PATH                  = "/opt/ibc/ibc.sh"
@@ -261,11 +280,22 @@ IBC_2FA_TIME              = "18:00"
 IBC_RESTART_TIMEOUT       = 120         # Seconds to wait for TWS restart
 
 # ── Scheduling (all times NY / ET) ─────────────────────────────────────────────
-TIME_NIGHTLY_SYNC         = "20:00"     # TwelveData incremental DB update + watchlist precompute
-TIME_SIGNAL_SNAP          = "15:40"     # IB intraday snapshot + signal run
-TIME_ORDER_SUBMIT         = "15:44"     # LOC/MOC order submission (NYSE hard deadline: 15:45)
-TIME_FILL_CONFIRM         = "16:10"     # Post-close fill reconciliation
-TIME_DAILY_REPORT         = "16:15"     # Monitor report / alerts
+TIME_NIGHTLY_SYNC           = "20:00"   # Fixed — not relative to market close
+
+# ── Intraday job offsets from market close (minutes, signed) ───────────────────
+# market_open_check() at 11:00 ET computes run_time = close_time + timedelta(minutes=offset).
+# On a half day (13:00 close) jobs shift automatically — no manual intervention needed.
+SCHED_SIGNAL_OFFSET_MIN     = -20       # signal_snap:         close − 20 min  (normal: 15:40 ET)
+SCHED_ORDER_OFFSET_MIN      = -16       # order_submission:    close − 16 min  (normal: 15:44 ET)
+SCHED_FILL_OFFSET_MIN       = +10       # fill_reconciliation: close + 10 min  (normal: 16:10 ET)
+SCHED_REPORT_OFFSET_MIN     = +15       # daily_report:        close + 15 min  (normal: 16:15 ET)
+
+# ── Half-day calendar fallback ──────────────────────────────────────────────────
+HALF_DAY_DATES: list[str] = [
+    # NYSE early-close dates (13:00 ET) not yet reflected in pandas_market_calendars.
+    # Add YYYY-MM-DD strings here when the library lags behind announced schedule changes.
+    # Example: "2026-11-27"   # Black Friday 2026
+]
 
 # ── Order execution ─────────────────────────────────────────────────────────────
 ENTRY_ORDER_TYPE          = "LOC"       # "MOC" | "LOC"
@@ -273,8 +303,11 @@ ENTRY_LOC_BUFFER_PCT      = 0.003       # 0.3% above snap price; ignored if MOC
 EXIT_ORDER_TYPE           = "MOC"       # Keep exits as MOC — non-execution risk too high
 
 # ── Data sources ────────────────────────────────────────────────────────────────
-TWELVEDATA_API_KEY        = "YOUR_KEY_HERE"
-UNIVERSE_CSV              = "state/universe.csv"
+TWELVEDATA_API_KEY            = "YOUR_KEY_HERE"
+TWELVEDATA_INCREMENTAL_DAYS   = 5           # Normal nightly lookback (fetch_bars per-symbol path)
+TWELVEDATA_HISTORY_DAYS       = 550         # Full history depth for new symbols (~252 bars + buffer)
+TWELVEDATA_RATE_LIMIT_PER_MIN = 8           # Max requests per minute (free tier = 8); enforced in fetch_bars()
+UNIVERSE_CSV                  = "state/universe.csv"
 
 # ── Database ────────────────────────────────────────────────────────────────────
 DB_DRIVER                 = "sqlite"    # "sqlite" | "postgresql"
@@ -351,8 +384,6 @@ SYMBOL_WHITELIST          = []          # Always included regardless of S&P memb
 SP500_CSV_URL             = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 SP500_UPDATE_DAY          = "sunday"    # Day to refresh constituent list
 SP500_UPDATE_TIME         = "17:00"     # NY time — before IBC reauth
-TWELVEDATA_HISTORY_DAYS   = 550         # Full history depth for new symbols (~252 bars + buffer)
-TWELVEDATA_INCREMENTAL_DAYS = 5         # Normal nightly lookback
 
 # ── Future: Web dashboard ───────────────────────────────────────────────────────
 WEBSERVER_HOST            = "0.0.0.0"
@@ -813,38 +844,24 @@ Uses APScheduler `BlockingScheduler` with `timezone=config.TZ`. All jobs anchore
 
 #### Fixed cron triggers (registered at startup)
 
-```
-Sun SP500_UPDATE_TIME ET — sunday_universe_update()
-    fetch_sp500_symbols() → diff against universe.csv → rewrite universe.csv
-    → log added / removed symbols (no calendar gate)
-
-Sun IBC_2FA_TIME ET      — sunday_reauth()
-    IBCController stop → wait → start → wait_for_api → IBBridge reconnect → alert
-
-Mon–Fri 09:00 ET         — connectivity_check()   [no calendar gate]
-    bridge.heartbeat() → if False: reconnect once → heartbeat() again
-    → on recovery: info alert
-    → on persistent failure: critical alert + risk_engine halt
-
-Mon–Fri 20:00 ET         — nightly_sync()   [NYSE calendar gate]
-    TwelveData incremental bar update for all symbols
-    → precompute_watchlist() immediately after
-
-Mon–Fri 11:00 ET         — market_open_check()   [NYSE calendar gate]
-    get_market_schedule() → determine close_time and is_half_day
-    → register four intraday DateTrigger jobs for the correct times today
-```
+| Job | Schedule (ET) | Calendar gate | Description |
+|---|---|---|---|
+| `sunday_universe_update` | `SP500_UPDATE_DAY` at `SP500_UPDATE_TIME` | None | S&P 500 universe refresh + full history fetch for new symbols |
+| `sunday_reauth` | Sunday at `IBC_2FA_TIME` | None | IBC stop → start → 2FA → reconnect → alert |
+| `connectivity_check` | Mon–Fri 09:00 | None | `bridge.heartbeat()` → reconnect on failure → critical alert + halt if unrecoverable |
+| `nightly_sync` | Mon–Fri `TIME_NIGHTLY_SYNC` | NYSE | TwelveData incremental bar update → `precompute_watchlist()` |
+| `market_open_check` | Mon–Fri 11:00 | NYSE | Determine close time; register four intraday DateTrigger jobs |
 
 #### Dynamically registered intraday jobs (DateTrigger, one-off)
 
-The four intraday jobs are **not** fixed cron triggers. At 11:00 ET, `market_open_check()` calls `get_market_schedule()` to obtain today's close time, then registers each job as a one-off `DateTrigger` at the correct offset:
+The four intraday jobs are **not** fixed cron triggers. At 11:00 ET, `market_open_check()` calls `get_market_schedule()` to obtain today's `close_time`, then registers each job as a one-off `DateTrigger` at `close_time + timedelta(minutes=SCHED_*_OFFSET_MIN)`. All four jobs are registered with `replace_existing=True`, making the 11:00 call idempotent if it fires more than once in a session.
 
-| Job | Offset | Normal day | Half day (close 13:00) |
-|---|---|---|---|
-| `signal_snap` | close − 20 min | 15:40 ET | 12:40 ET |
-| `order_submission` | close − 16 min | 15:44 ET | 12:44 ET |
-| `fill_reconciliation` | close + 10 min | 16:10 ET | 13:10 ET |
-| `daily_report` | close + 15 min | 16:15 ET | 13:15 ET |
+| Job | Config param | Default | Normal day (close 16:00) | Half day (close 13:00) |
+|---|---|---|---|---|
+| `signal_snap` | `SCHED_SIGNAL_OFFSET_MIN` | −20 | 15:40 ET | 12:40 ET |
+| `order_submission` | `SCHED_ORDER_OFFSET_MIN` | −16 | 15:44 ET | 12:44 ET |
+| `fill_reconciliation` | `SCHED_FILL_OFFSET_MIN` | +10 | 16:10 ET | 13:10 ET |
+| `daily_report` | `SCHED_REPORT_OFFSET_MIN` | +15 | 16:15 ET | 13:15 ET |
 
 ```
 signal_snap
@@ -865,7 +882,7 @@ fill_reconciliation
     → update positions table (new entries)
     → close_position() for exits → append to trade_log
     → append_equity_snapshot()
-    → reconcile_with_ib() → alert on mismatch (split symbols excluded)
+    → _reconcile_with_ib() against full live IB position list → alert on mismatch (split symbols excluded)
     → export_positions_json() if EXPORT_STATE_JSON=True
 
 daily_report
@@ -876,9 +893,9 @@ daily_report
 
 #### Half-day handling
 
-`get_market_schedule(d)` returns `{"is_open": bool, "close_time": datetime, "is_half_day": bool}`. A session is flagged as a half day when `close_time` (ET) is before 14:00. `pandas_market_calendars` handles the detection automatically for all known NYSE early-close dates (day before July 4th, Black Friday, Christmas Eve when a weekday, etc.).
+`get_market_schedule(d)` returns `{"is_open": bool, "close_time": datetime, "is_half_day": bool}`. A session is flagged as a half day when `close_time` (ET) is before 14:00. `pandas_market_calendars` handles detection automatically for all known NYSE early-close dates (day before July 4th, Black Friday, Christmas Eve when a weekday, etc.).
 
-`config.HALF_DAY_DATES` is a fallback list of `YYYY-MM-DD` strings. Any date in this list overrides the calendar data with a 13:00 ET close — use it when the library has not yet been updated for a newly announced schedule change.
+`config.HALF_DAY_DATES` is a fallback list of `YYYY-MM-DD` strings. Any date in this list overrides the calendar data with a 13:00 ET close — use it when the library has not yet been updated for a newly announced schedule change. The override is applied inside `get_market_schedule()` before the `is_half_day` flag is set, so all downstream logic (intraday job times, half-day logging) is consistent.
 
 ---
 

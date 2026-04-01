@@ -20,7 +20,7 @@ from ib_exec import (
     IBCController,
     Order,
     OrderRejectedError,
-    _SENTINEL,
+    SENTINEL,
     detect_splits,
     get_account_summary,
     get_filled_orders,
@@ -326,7 +326,7 @@ class TestGetFilledOrders:
         def _side_effect(req_id, exec_filter):
             for fill in fills:
                 bridge._exec_q.put(fill)
-            bridge._exec_q.put(_SENTINEL)
+            bridge._exec_q.put(SENTINEL)
         return _side_effect
 
     def test_returns_fills_for_requested_ids(self):
@@ -401,7 +401,7 @@ class TestGetAccountSummary:
         def _side_effect(req_id, group, tag_str):
             for tag, value in tags.items():
                 bridge._account_q.put({"tag": tag, "value": value})
-            bridge._account_q.put(_SENTINEL)
+            bridge._account_q.put(SENTINEL)
         return _side_effect
 
     def test_returns_required_keys(self):

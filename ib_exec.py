@@ -47,7 +47,7 @@ import config
 logger = logging.getLogger("murphy")
 
 # ── Sentinel: marks the end of a streaming response on a queue ────────────────
-_SENTINEL = object()
+SENTINEL = object()
 
 # ── Account tags requested from IB ───────────────────────────────────────────
 _ACCOUNT_TAGS = "NetLiquidation,TotalCashValue,BuyingPower"
@@ -218,7 +218,7 @@ class IBBridge(EWrapper, EClient):
         self._account_q.put({"tag": tag, "value": value})
 
     def accountSummaryEnd(self, reqId: int) -> None:
-        self._account_q.put(_SENTINEL)
+        self._account_q.put(SENTINEL)
 
     def execDetails(
         self, reqId: int, contract: Contract, execution
@@ -231,7 +231,7 @@ class IBBridge(EWrapper, EClient):
         })
 
     def execDetailsEnd(self, reqId: int) -> None:
-        self._exec_q.put(_SENTINEL)
+        self._exec_q.put(SENTINEL)
 
     def position(
         self, account: str, contract: Contract, pos: float, avgCost: float
@@ -244,7 +244,7 @@ class IBBridge(EWrapper, EClient):
             })
 
     def positionEnd(self) -> None:
-        self._position_q.put(_SENTINEL)
+        self._position_q.put(SENTINEL)
 
     def orderStatus(
         self,
@@ -309,7 +309,7 @@ class IBBridge(EWrapper, EClient):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _get_next_order_id(self) -> int:
+    def get_next_order_id(self) -> int:
         """Return the current next-valid order ID and increment the local counter."""
         with self._order_id_lock:
             oid = self._next_order_id
@@ -379,7 +379,7 @@ def submit_order(bridge: IBBridge, order: Order) -> int:
     if config.IB_SUBACCOUNT:
         ib_order.account = config.IB_SUBACCOUNT
 
-    order_id = bridge._get_next_order_id()
+    order_id = bridge.get_next_order_id()
     bridge.placeOrder(order_id, contract, ib_order)
 
     logger.info(
@@ -414,7 +414,7 @@ def get_filled_orders(
     """
     bridge._drain(bridge._exec_q)
 
-    req_id = bridge._get_next_order_id()
+    req_id = bridge.get_next_order_id()
     bridge.reqExecutions(req_id, ExecutionFilter())
 
     results: dict[int, dict] = {}
@@ -426,7 +426,7 @@ def get_filled_orders(
         except queue.Empty:
             logger.warning("[ib] get_filled_orders timed out waiting for execDetailsEnd")
             break
-        if item is _SENTINEL:
+        if item is SENTINEL:
             break
         oid = item["order_id"]
         if not filter_set or oid in filter_set:
@@ -452,7 +452,7 @@ def get_account_summary(bridge: IBBridge) -> dict:
     """
     bridge._drain(bridge._account_q)
 
-    req_id  = bridge._get_next_order_id()
+    req_id  = bridge.get_next_order_id()
     account = config.IB_SUBACCOUNT if config.IB_SUBACCOUNT else "All"
     bridge.reqAccountSummary(req_id, account, _ACCOUNT_TAGS)
 
@@ -463,7 +463,7 @@ def get_account_summary(bridge: IBBridge) -> dict:
         except queue.Empty:
             logger.warning("[ib] get_account_summary timed out waiting for accountSummaryEnd")
             break
-        if item is _SENTINEL:
+        if item is SENTINEL:
             break
         raw[item["tag"]] = item["value"]
 
@@ -498,7 +498,7 @@ def get_ib_positions(bridge: IBBridge) -> list[dict]:
         except queue.Empty:
             logger.warning("[ib] get_ib_positions timed out waiting for positionEnd")
             break
-        if item is _SENTINEL:
+        if item is SENTINEL:
             break
         results.append(item)
 
