@@ -10,3 +10,5 @@ state/
 
 # Virtual environments
 .venv
+
+config.py

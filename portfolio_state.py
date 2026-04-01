@@ -41,6 +41,10 @@ _POS_COLUMNS = (
     "actual_risk_frac",
     "consec_lows",
     "ib_order_id",
+    "order_type",
+    "limit_price",
+    "qpi_at_entry",
+    "ibs_at_entry",
 )
 
 

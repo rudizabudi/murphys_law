@@ -46,8 +46,8 @@ DATA_DIR                  = _BASE / "data"   # input for migrate.py only
 
 # ── IB Connection ───────────────────────────────────────────────────────────────
 IB_HOST                   = "127.0.0.1"
-IB_PORT                   = 7498        # 7497 for paper trading
-IB_CLIENT_ID              = 1000
+IB_PORT                   = 7496        # 7497 for paper trading
+IB_CLIENT_ID              = 1
 IB_SUBACCOUNT             = ""          # Subaccount ID (e.g. "DU1234567"); empty = use master account
 IB_HEARTBEAT_TIMEOUT_SEC  = 5           # seconds to wait for reqCurrentTime response
 IB_SOFT_ERROR_CODES       = [2104, 2106, 2107, 2108, 2158]   # informational; not logged as errors

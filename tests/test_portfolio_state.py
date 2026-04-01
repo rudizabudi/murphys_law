@@ -48,6 +48,10 @@ def _make_pos(
     actual_risk_frac=0.15,
     consec_lows=0,
     ib_order_id=None,
+    order_type=None,
+    limit_price=None,
+    qpi_at_entry=None,
+    ibs_at_entry=None,
 ) -> dict:
     return {
         "pos_id":           pos_id,
@@ -62,6 +66,10 @@ def _make_pos(
         "actual_risk_frac": actual_risk_frac,
         "consec_lows":      consec_lows,
         "ib_order_id":      ib_order_id,
+        "order_type":       order_type,
+        "limit_price":      limit_price,
+        "qpi_at_entry":     qpi_at_entry,
+        "ibs_at_entry":     ibs_at_entry,
     }
 
 
@@ -152,6 +160,71 @@ class TestSavePosition:
         portfolio_state.save_position(_make_pos(consec_lows=3))
         rows = portfolio_state.load_positions()
         assert rows[0]["consec_lows"] == 3
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestEntryMetadataColumns
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestEntryMetadataColumns:
+    """Verify order_type, limit_price, qpi_at_entry, ibs_at_entry round-trip correctly."""
+
+    def test_all_four_columns_persisted(self):
+        pos = _make_pos(
+            order_type="LOC",
+            limit_price=151.50,
+            qpi_at_entry=0.08,
+            ibs_at_entry=0.14,
+        )
+        portfolio_state.save_position(pos)
+        row = portfolio_state.load_positions()[0]
+        assert row["order_type"]    == "LOC"
+        assert abs(row["limit_price"]  - 151.50) < 1e-9
+        assert abs(row["qpi_at_entry"] - 0.08)   < 1e-9
+        assert abs(row["ibs_at_entry"] - 0.14)   < 1e-9
+
+    def test_null_when_not_provided(self):
+        pos = _make_pos()  # order_type/limit_price/qpi/ibs all None by default
+        portfolio_state.save_position(pos)
+        row = portfolio_state.load_positions()[0]
+        assert row["order_type"]    is None
+        assert row["limit_price"]   is None
+        assert row["qpi_at_entry"]  is None
+        assert row["ibs_at_entry"]  is None
+
+    def test_upsert_preserves_entry_metadata(self):
+        """A subsequent save_position() call (e.g. bars_held update) must not wipe the entry columns."""
+        pos = _make_pos(
+            order_type="LOC",
+            limit_price=200.0,
+            qpi_at_entry=0.05,
+            ibs_at_entry=0.10,
+        )
+        portfolio_state.save_position(pos)
+
+        # Simulate a daily bars_held increment that also carries the metadata
+        pos2 = {**pos, "bars_held": 3}
+        portfolio_state.save_position(pos2)
+
+        row = portfolio_state.load_positions()[0]
+        assert row["bars_held"]     == 3
+        assert row["order_type"]    == "LOC"
+        assert abs(row["limit_price"]  - 200.0) < 1e-9
+        assert abs(row["qpi_at_entry"] - 0.05)  < 1e-9
+        assert abs(row["ibs_at_entry"] - 0.10)  < 1e-9
+
+    def test_moc_order_type(self):
+        pos = _make_pos(order_type="MOC", limit_price=None)
+        portfolio_state.save_position(pos)
+        row = portfolio_state.load_positions()[0]
+        assert row["order_type"]  == "MOC"
+        assert row["limit_price"] is None
+
+    def test_entry_metadata_present_in_load_positions_keys(self):
+        portfolio_state.save_position(_make_pos(order_type="LOC", limit_price=100.0))
+        row = portfolio_state.load_positions()[0]
+        for key in ("order_type", "limit_price", "qpi_at_entry", "ibs_at_entry"):
+            assert key in row, f"Missing key: {key}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -184,6 +184,7 @@ murphy_law/
     ├── test_td_data.py
     ├── test_ib_data.py
     ├── test_main.py
+    ├── test_scheduler.py
     └── test_universe.py
 ```
 
