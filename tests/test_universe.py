@@ -135,6 +135,7 @@ class TestUpdateUniverse:
         csv_path = tmp_path / "universe.csv"
         monkeypatch.setattr(config, "UNIVERSE_CSV", str(csv_path))
         monkeypatch.setattr(config, "SYMBOL_WHITELIST", [])
+        monkeypatch.setattr(config, "SYMBOL_BLACKLIST", [])
         return csv_path
 
     def test_writes_universe_csv(self, tmp_path):
@@ -240,6 +241,7 @@ class TestGetNewSymbols:
         monkeypatch.setattr(config, "DB_DRIVER", "sqlite")
         monkeypatch.setattr(config, "DB_PATH", db_path)
         monkeypatch.setattr(config, "UNIVERSE_CSV", csv_path)
+        monkeypatch.setattr(config, "SYMBOL_BLACKLIST", [])
         db.init_db()
 
     def _seed_bars(self, symbol: str, n_rows: int) -> None:
@@ -303,3 +305,67 @@ class TestGetNewSymbols:
         self._seed_bars("AAPL", n)
         result = get_new_symbols()
         assert "AAPL" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestBlacklist
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBlacklist:
+    """Blacklisted symbols are excluded from update_universe() and get_new_symbols()."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        csv_path = str(tmp_path / "universe.csv")
+        db_path  = str(tmp_path / "state" / "bars.db")
+        monkeypatch.setattr(config, "UNIVERSE_CSV", csv_path)
+        monkeypatch.setattr(config, "DB_DRIVER", "sqlite")
+        monkeypatch.setattr(config, "DB_PATH", db_path)
+        monkeypatch.setattr(config, "SYMBOL_WHITELIST", [])
+        monkeypatch.setattr(config, "SYMBOL_BLACKLIST", ["BRKB", "BFB"])
+        db.init_db()
+
+    def test_update_universe_excludes_blacklisted(self):
+        with patch("httpx.get", return_value=_mock_httpx_response(_SAMPLE_CSV)):
+            result = update_universe()
+        written = _read_universe_csv()
+        assert "BRKB" not in written
+        assert "BFB"  not in written
+        assert "AAPL" in written
+
+    def test_update_universe_total_excludes_blacklisted(self):
+        # _SAMPLE_CSV has 5 symbols; BRKB and BFB are blacklisted → total = 3
+        with patch("httpx.get", return_value=_mock_httpx_response(_SAMPLE_CSV)):
+            result = update_universe()
+        assert result["total"] == 3
+
+    def test_update_universe_blacklisted_not_in_added(self):
+        with patch("httpx.get", return_value=_mock_httpx_response(_SAMPLE_CSV)):
+            result = update_universe()
+        assert "BRKB" not in result["added"]
+        assert "BFB"  not in result["added"]
+
+    def test_blacklisted_symbol_in_csv_excluded_by_read(self, monkeypatch):
+        """If a blacklisted symbol is already on disk, _read_universe_csv must exclude it."""
+        # Write directly (bypassing blacklist filtering in update_universe)
+        _write_universe_csv(["AAPL", "BRKB", "MSFT"])
+        symbols = _read_universe_csv()
+        assert "BRKB" not in symbols
+        assert "AAPL" in symbols
+        assert "MSFT" in symbols
+
+    def test_get_new_symbols_excludes_blacklisted(self):
+        """get_new_symbols relies on _read_universe_csv so blacklist applies there too."""
+        _write_universe_csv(["AAPL", "BRKB"])
+        result = get_new_symbols()
+        assert "BRKB" not in result
+        assert "AAPL" in result
+
+    def test_empty_blacklist_no_exclusion(self, monkeypatch):
+        monkeypatch.setattr(config, "SYMBOL_BLACKLIST", [])
+        with patch("httpx.get", return_value=_mock_httpx_response(_SAMPLE_CSV)):
+            result = update_universe()
+        assert result["total"] == 5
+        written = _read_universe_csv()
+        assert "BRKB" in written
+        assert "BFB"  in written

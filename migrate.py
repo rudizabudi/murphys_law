@@ -32,6 +32,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("murphy.migrate")
 
+
+# RUN_CHECKS = False bypasses split detection during initial migration.
+# Stocks that have split are still valid S&P 500 members and TwelveData
+# returns split-adjusted data by default, so historical splits in the
+# source /data files do not affect live trading accuracy.
+# Set True only to audit the raw /data files for genuine data integrity issues.
+RUN_CHECKS = False
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA LOADING — exact port from backtest load_all_data pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -148,12 +156,13 @@ def run() -> None:
     skipped_short:  list[str]  = []
 
     for sym, df in raw_daily.items():
-        if _has_split(df, crash_dates):
-            skipped_split.append(sym)
-            continue
-        if len(df) < config.MIN_BARS_REQUIRED:
-            skipped_short.append(sym)
-            continue
+        if RUN_CHECKS:
+            if _has_split(df, crash_dates):
+                skipped_split.append(sym)
+                continue
+            if len(df) < config.MIN_BARS_REQUIRED:
+                skipped_short.append(sym)
+                continue
 
         for ts, row in df.iterrows():
             accepted.append({

@@ -282,12 +282,16 @@ IB_SOFT_ERROR_CODES       = [2104, 2106, 2107, 2108, 2158]   # Informational; lo
 IB_REJECTION_CODES        = [201, 202, 203, 321, 322]         # Hard order rejections; raise OrderRejectedError
 
 # ── IBC (automated TWS/Gateway login) ──────────────────────────────────────────
-IBC_PATH                  = "/opt/ibc/ibc.sh"
-IBC_TWS_PATH              = "/opt/Trader Workstation"
-IBC_CONFIG_PATH           = "/opt/ibc/config.ini"
-IBC_2FA_DAY               = "sunday"
-IBC_2FA_TIME              = "18:00"
-IBC_RESTART_TIMEOUT       = 120         # Seconds to wait for TWS restart
+IBC_MODE              = "gateway"          # "gateway" | "tws"
+IBC_DIR               = "/opt/ibc"         # IBC installation directory
+IBC_GATEWAY_START     = "/opt/ibc/gatewaystart.sh"
+IBC_TWS_START         = "/opt/ibc/twsstart.sh"
+IBC_COMMAND_SEND      = "/opt/ibc/commandsend.sh"
+IBC_TWS_PATH          = "/opt/Trader Workstation"
+IBC_CONFIG_PATH       = "/opt/ibc/config.ini"
+IBC_2FA_DAY           = "sunday"
+IBC_2FA_TIME          = "18:00"
+IBC_RESTART_TIMEOUT   = 120               # Seconds to wait for TWS/Gateway restart
 
 # ── Scheduling (all times NY / ET) ─────────────────────────────────────────────
 TIME_NIGHTLY_SYNC           = "20:00"   # Fixed — not relative to market close
@@ -391,6 +395,7 @@ RISK_IMBALANCE_ACTION           = ["reject"]
 
 # ── S&P 500 universe management ────────────────────────────────────────────────
 SYMBOL_WHITELIST          = []          # Always included regardless of S&P membership
+SYMBOL_BLACKLIST          = ["BRKB", "BFB"]   # Excluded from universe (e.g. not available on TwelveData plan)
 SP500_CSV_URL             = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 SP500_UPDATE_DAY          = "sunday"    # Day to refresh constituent list
 SP500_UPDATE_TIME         = "17:00"     # NY time — before IBC reauth
@@ -441,7 +446,7 @@ CREATE TABLE IF NOT EXISTS watchlist (
 Consumes all `*_5min.json` files in `/data`. Applies the same pipeline as the backtest:
 1. Load 5-min JSON (market hours 09:30–16:00)
 2. Resample to daily OHLCV (same logic as backtest `resample_to_daily()`)
-3. Run split integrity check (same logic as backtest `symbol_likely_has_split()`)
+3. RIf toggled on run split integrity check (same logic as backtest `symbol_likely_has_split()`)
 4. Require `MIN_BARS_REQUIRED` daily bars
 5. Upsert accepted symbols into `daily_bars`
 
@@ -521,6 +526,12 @@ def get_new_symbols() -> list[str]:
 - Whitelist symbols are unioned into the universe on every `update_universe()` call
 - A whitelist symbol is never written to `removed` even if it drops out of the S&P 500
 - Whitelist symbols with insufficient history are caught by `get_new_symbols()` on the next nightly sync, same as any new constituent
+
+**Blacklist behaviour:**
+- `config.SYMBOL_BLACKLIST` accepts normalised tickers (same format as `SYMBOL_WHITELIST`)
+- Blacklisted symbols are subtracted from the universe in `update_universe()` — they never appear in the written CSV or in `added`/`removed` diffs
+- `_read_universe_csv()` also filters them out on every read, so any symbol already present in `universe.csv` is silently excluded until the blacklist entry is removed
+- Exclusions are logged at INFO level
 
 ---
 
@@ -771,21 +782,25 @@ Two layers of connection management:
 ```python
 class IBCController:
     """Thin wrapper around IBC shell commands."""
-    def stop_gateway(self): ...     # subprocess call to IBC stop
-    def start_gateway(self): ...    # subprocess call to IBC start
+    def stop_gateway(self): ...     # commandsend.sh stop — sends stop to running IBC instance
+    def start_gateway(self): ...    # gatewaystart.sh (IBC_MODE="gateway") or twsstart.sh (IBC_MODE="tws")
     def wait_for_api(self, timeout: int) -> bool: ...  # Poll IB_PORT until open
 
 class IBBridge:
     def connect(self): ...
     def disconnect(self): ...
     def is_connected(self) -> bool: ...
-    def reconnect(self): ...        # disconnect → short sleep → connect
+    def reconnect(self): ...           # disconnect → short sleep → connect
+    def wait_for_disconnect(self): ... # blocks until connectionClosed() fires
+    def clear_disconnect(self): ...    # resets the event for the next disconnect cycle
 ```
 
+**Disconnect event mechanism:** `IBBridge._disconnect_event` is a `threading.Event` initialised in `__init__`. The `connectionClosed()` EWrapper callback (fired by ibapi when the TCP connection is lost) calls `_disconnect_event.set()`. `wait_for_disconnect()` blocks on this event; `clear_disconnect()` resets it. The `connection_watchdog()` daemon thread in `scheduler.py` blocks on `wait_for_disconnect()` and reconnects immediately when the event fires — up to 3 retries at 10-second intervals, critical alert if all fail.
+
 **Sunday reauth job** (runs at `IBC_2FA_TIME` every `IBC_2FA_DAY`):
-1. `IBCController.stop_gateway()` — graceful shutdown
+1. `IBCController.stop_gateway()` — runs `commandsend.sh stop` to gracefully shut down the running instance
 2. Wait for process to terminate
-3. `IBCController.start_gateway()` — IBC relaunches TWS and handles 2FA automatically via `TwsLoginMode` in IBC config
+3. `IBCController.start_gateway()` — runs `gatewaystart.sh` (or `twsstart.sh` if `IBC_MODE="tws"`), passing `IBC_DIR` and `IBC_CONFIG_PATH`; IBC handles 2FA automatically via `TwsLoginMode` in config.ini
 4. `IBCController.wait_for_api(IBC_RESTART_TIMEOUT)` — poll until API port responds
 5. `IBBridge.reconnect()`
 6. `send_alert()` with success or failure
@@ -855,6 +870,12 @@ Informational codes (`IB_SOFT_ERROR_CODES`: 2104, 2106, 2107, 2108, 2158) are lo
 **File:** `scheduler.py`
 
 Uses APScheduler `BlockingScheduler` with `timezone=config.TZ`. All jobs anchored to NY time regardless of host machine timezone.
+
+#### Daemon threads (started at startup, before the scheduler)
+
+| Thread | Name | Description |
+|---|---|---|
+| `connection_watchdog` | `ib-watchdog` | Blocks on `bridge.wait_for_disconnect()`; on disconnect attempts `bridge.connect()` up to 3 times at 10-second intervals; critical alert if all retries fail; resets the event and loops |
 
 #### Fixed cron triggers (registered at startup)
 
@@ -1131,6 +1152,9 @@ Both items below were previously listed as gaps and have been implemented.
 
 ### 9.8 Earnings Blackout
 No earnings blackout filter (unlike ZMS strategy). Optional enhancement for a later version — not required for backtest parity.
+
+### 9.9 Blacklisted Symbols (BRKB, BFB)
+`BRKB` (BRK.B) and `BFB` (BF.B) are excluded from the universe by default via `config.SYMBOL_BLACKLIST` because TwelveData's free tier does not provide data for Berkshire Hathaway B-shares and Brown-Forman B-shares. Both are legitimate S&P 500 constituents that the backtest traded. To include them, either upgrade to a TwelveData plan that covers these symbols or add an alternative data source and remove them from `SYMBOL_BLACKLIST`.
 
 ---
 

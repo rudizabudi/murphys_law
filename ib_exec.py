@@ -114,31 +114,42 @@ class IBCController:
     """
     Thin wrapper around IBC shell commands.
 
-    IBC is assumed to be installed at config.IBC_PATH (e.g. /opt/ibc/ibc.sh).
-    The script is expected to accept "stop" and "start" as its first positional
-    argument — adjust if your IBC installation uses a different interface.
+    Uses IBC's actual script interface:
+      gatewaystart.sh / twsstart.sh  — launch Gateway or TWS (selected by IBC_MODE)
+      commandsend.sh stop            — gracefully stop a running instance
+
+    Calling convention for start scripts (IBC >= 3.x):
+      <start-script> <ib-dir> <ibc-config-ini> <tws-version>
+    The tws-version argument is passed as an empty string here; IBC will use
+    the version configured in config.ini when the argument is omitted or blank.
     """
 
     def stop_gateway(self) -> None:
-        """Send a graceful stop command to IBC / IB Gateway."""
-        logger.info("[ibc] Stopping Gateway via IBC.")
+        """Send a graceful stop command to the running IBC instance via commandsend.sh."""
+        logger.info("[ibc] Stopping Gateway via IBC commandsend.sh stop.")
         subprocess.run(
-            [config.IBC_PATH, "stop"],
+            [config.IBC_COMMAND_SEND, "stop"],
             check=False,
             capture_output=True,
             text=True,
         )
 
     def start_gateway(self) -> None:
-        """Launch IB Gateway through IBC (handles 2FA via TwsLoginMode in config.ini)."""
-        logger.info("[ibc] Starting Gateway via IBC: %s", config.IBC_PATH)
+        """
+        Launch IB Gateway (or TWS) through IBC.
+
+        Uses config.IBC_GATEWAY_START when IBC_MODE == "gateway",
+        otherwise config.IBC_TWS_START.  Handles 2FA automatically
+        via TwsLoginMode in config.IBC_CONFIG_PATH.
+        """
+        start_script = (
+            config.IBC_GATEWAY_START
+            if config.IBC_MODE == "gateway"
+            else config.IBC_TWS_START
+        )
+        logger.info("[ibc] Starting %s via IBC: %s", config.IBC_MODE, start_script)
         subprocess.run(
-            [
-                config.IBC_PATH,
-                "start",
-                "--tws-path",     config.IBC_TWS_PATH,
-                "--ibc-ini",      config.IBC_CONFIG_PATH,
-            ],
+            [start_script, config.IBC_DIR, config.IBC_CONFIG_PATH, ""],
             check=False,
             capture_output=True,
             text=True,
@@ -206,6 +217,9 @@ class IBBridge(EWrapper, EClient):
 
         self._thread: threading.Thread | None = None
 
+        # Disconnect event — set by connectionClosed(); waited on by the watchdog.
+        self._disconnect_event: threading.Event = threading.Event()
+
     # ── EWrapper callbacks ────────────────────────────────────────────────────
 
     def nextValidId(self, orderId: int) -> None:
@@ -265,6 +279,11 @@ class IBBridge(EWrapper, EClient):
             orderId, status, filled, avgFillPrice,
         )
 
+    def connectionClosed(self) -> None:
+        """Fired by ibapi when the TCP connection to TWS/Gateway is lost."""
+        logger.warning("[ib] connectionClosed: IB disconnect detected")
+        self._disconnect_event.set()
+
     def currentTime(self, time_val: int) -> None:
         self._time_q.put(time_val)
 
@@ -306,6 +325,14 @@ class IBBridge(EWrapper, EClient):
         self.disconnect()
         time.sleep(3)
         self.connect()
+
+    def wait_for_disconnect(self) -> None:
+        """Block until connectionClosed() fires (i.e. IB drops the connection)."""
+        self._disconnect_event.wait()
+
+    def clear_disconnect(self) -> None:
+        """Reset the disconnect event so wait_for_disconnect() can block again."""
+        self._disconnect_event.clear()
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -366,6 +393,8 @@ def submit_order(bridge: IBBridge, order: Order) -> int:
     contract.currency = "USD"
 
     ib_order = IBOrder()
+    ib_order.eTradeOnly    = False
+    ib_order.firmQuoteOnly = False
     ib_order.action        = order.action
     ib_order.totalQuantity = order.quantity
 

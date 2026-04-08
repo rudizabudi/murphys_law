@@ -74,15 +74,27 @@ def fetch_sp500_symbols() -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _read_universe_csv() -> list[str]:
-    """Read current universe.csv; return [] if absent or empty."""
+    """Read current universe.csv; return [] if absent or empty.
+
+    Symbols present in config.SYMBOL_BLACKLIST are excluded on read so
+    callers never operate on blacklisted tickers, even if they exist on disk.
+    """
     path = Path(config.UNIVERSE_CSV)
     if not path.exists():
         return []
+    blacklist = set(config.SYMBOL_BLACKLIST)
     symbols: list[str] = []
+    excluded: list[str] = []
     with open(path, newline="") as fh:
         for row in csv.reader(fh):
             if row and row[0].strip() and not row[0].strip().startswith("#"):
-                symbols.append(row[0].strip())
+                sym = row[0].strip()
+                if sym in blacklist:
+                    excluded.append(sym)
+                else:
+                    symbols.append(sym)
+    if excluded:
+        logger.info("[universe] _read_universe_csv: excluded blacklisted symbols: %s", excluded)
     return symbols
 
 
@@ -110,7 +122,11 @@ def update_universe() -> dict:
     sp500 = fetch_sp500_symbols()
 
     whitelist = [_normalise_ticker(s) for s in config.SYMBOL_WHITELIST if s.strip()]
-    new_universe = sorted(set(sp500) | set(whitelist))
+    blacklist = set(config.SYMBOL_BLACKLIST)
+    new_universe = sorted((set(sp500) | set(whitelist)) - blacklist)
+    excluded = sorted((set(sp500) | set(whitelist)) & blacklist)
+    if excluded:
+        logger.info("[universe] update_universe: excluded blacklisted symbols: %s", excluded)
 
     old_universe = _read_universe_csv()
     old_set      = set(old_universe)

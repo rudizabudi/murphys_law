@@ -47,19 +47,23 @@ DATA_DIR                  = _BASE / "data"   # input for migrate.py only
 # ── IB Connection ───────────────────────────────────────────────────────────────
 IB_HOST                   = "127.0.0.1"
 IB_PORT                   = 7498        # 7497 for paper trading
-IB_CLIENT_ID              = 1000
+IB_CLIENT_ID              = 1001
 IB_SUBACCOUNT             = ""          # Subaccount ID (e.g. "DU1234567"); empty = use master account
 IB_HEARTBEAT_TIMEOUT_SEC  = 5           # seconds to wait for reqCurrentTime response
-IB_SOFT_ERROR_CODES       = [2104, 2106, 2107, 2108, 2158]   # informational; not logged as errors
+IB_SOFT_ERROR_CODES       = [300, 2104, 2106, 2107, 2108, 2158, 10268]   # informational; not logged as errors
 IB_REJECTION_CODES        = [201, 202, 203, 321, 322]         # hard order rejections
 
 # ── IBC (automated TWS/Gateway login) ──────────────────────────────────────────
-IBC_PATH                  = "/opt/ibc/ibc.sh"
-IBC_TWS_PATH              = "/opt/Trader Workstation"
-IBC_CONFIG_PATH           = "/opt/ibc/config.ini"
-IBC_2FA_DAY               = "sunday"
-IBC_2FA_TIME              = "18:00"
-IBC_RESTART_TIMEOUT       = 120         # seconds to wait for TWS restart
+IBC_MODE              = "gateway"          # "gateway" | "tws"
+IBC_DIR               = "/home/rudizabudi/Jts/IBC/"         # IBC installation directory
+IBC_GATEWAY_START     = "/home/rudizabudi/Jts/IBC/gatewaystart.sh"
+IBC_TWS_START         = "/home/rudizabudi/Jts/IBC/twsstart.sh"
+IBC_COMMAND_SEND      = "/home/rudizabudi/Jts/IBC/commandsend.sh"
+IBC_TWS_PATH          = "/home/rudizabudi/Jts/Trader Workstation.desktop"
+IBC_CONFIG_PATH       = "/home/rudizabudi/Jts/IBC/config.ini"
+IBC_2FA_DAY           = "sunday"
+IBC_2FA_TIME          = "18:00"
+IBC_RESTART_TIMEOUT   = 120               # seconds to wait for TWS/Gateway restart
 
 # ── Scheduling (all times NY / ET) ─────────────────────────────────────────────
 TIME_NIGHTLY_SYNC           = "20:00"   # Fixed — not relative to market close
@@ -78,12 +82,12 @@ HALF_DAY_DATES: list[str] = [
 ]
 
 # ── Order execution ─────────────────────────────────────────────────────────────
-ENTRY_ORDER_TYPE          = "LOC"       # "MOC" | "LOC"
+ENTRY_ORDER_TYPE          = "MOC"       # "MOC" | "LOC"
 ENTRY_LOC_BUFFER_PCT      = 0.003       # 0.3% above snap price; ignored if MOC
 EXIT_ORDER_TYPE           = "MOC"       # keep exits as MOC — non-execution risk too high
 
 # ── Data sources ────────────────────────────────────────────────────────────────
-TWELVEDATA_API_KEY            = "YOUR_KEY_HERE"
+TWELVEDATA_API_KEY            = "537ffc80a90f4bbe91b80414a9aec78f"
 TWELVEDATA_INCREMENTAL_DAYS   = 5           # normal nightly lookback
 TWELVEDATA_HISTORY_DAYS       = 550         # full history depth for new symbols (~252 bars + buffer)
 TWELVEDATA_RATE_LIMIT_PER_MIN = 8           # Free tier: 8 credits/min. Paid plans support higher limits. Each symbol in a batch = 1 credit.
@@ -92,9 +96,9 @@ UNIVERSE_CSV                  = str(_BASE / "state" / "universe.csv")
 # ── Database ────────────────────────────────────────────────────────────────────
 DB_DRIVER                 = "sqlite"    # "sqlite" | "postgresql"
 DB_PATH                   = str(_BASE / "state" / "bars.db")   # SQLite only
-DB_HOST                   = "localhost"                         # PostgreSQL only
+DB_HOST                   = "localhost"                        # PostgreSQL only
 DB_PORT                   = 5432                               # PostgreSQL only
-DB_NAME                   = "murphy"                           # PostgreSQL only
+DB_NAME                   = "murphys_law"                      # PostgreSQL only
 DB_USER                   = ""                                 # PostgreSQL only
 DB_PASSWORD               = ""                                 # PostgreSQL only
 
@@ -116,7 +120,7 @@ SMTP_HOST                 = "smtp.gmail.com"
 SMTP_PORT                 = 587
 SMTP_USER                 = ""
 SMTP_PASSWORD             = ""          # use an app password, not account password
-DISCORD_WEBHOOK_URL       = ""          # empty = disabled
+DISCORD_WEBHOOK_URL       = "https://discordapp.com/api/webhooks/1488989061967384638/7Em1LGvnvaLlQNmRT0tnPS7zDVQjUFJjR1JiN7nobKRUqdYgAJgoAqrJ4W95nNwy2eIb"          # empty = disabled
 DISCORD_ALERT_MENTIONS    = ""          # e.g. "<@USER_ID>" prepended on critical alerts only
 
 # ── Risk controls (see Section 7 of ROADMAP for full documentation) ────────────
@@ -161,6 +165,7 @@ RISK_IMBALANCE_ACTION           = ["reject"]
 
 # ── S&P 500 universe management ────────────────────────────────────────────────
 SYMBOL_WHITELIST          = []          # always included regardless of S&P membership
+SYMBOL_BLACKLIST          = ["BRKB", "BFB"]   # symbols excluded from universe (e.g. not available on TwelveData plan)
 SP500_CSV_URL             = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 SP500_UPDATE_DAY          = "sunday"    # day to refresh constituent list
 SP500_UPDATE_TIME         = "17:00"     # NY time — before IBC reauth

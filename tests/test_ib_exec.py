@@ -89,7 +89,7 @@ class TestIBCController:
             ctrl.stop_gateway()
         mock_run.assert_called_once()
         args = mock_run.call_args[0][0]   # first positional arg = command list
-        assert args[0] == config.IBC_PATH
+        assert args[0] == config.IBC_COMMAND_SEND
         assert "stop" in args
 
     def test_start_gateway_calls_subprocess(self):
@@ -98,8 +98,14 @@ class TestIBCController:
             ctrl.start_gateway()
         mock_run.assert_called_once()
         args = mock_run.call_args[0][0]
-        assert args[0] == config.IBC_PATH
-        assert "start" in args
+        expected_script = (
+            config.IBC_GATEWAY_START
+            if config.IBC_MODE == "gateway"
+            else config.IBC_TWS_START
+        )
+        assert args[0] == expected_script
+        assert config.IBC_DIR in args
+        assert config.IBC_CONFIG_PATH in args
 
     def test_wait_for_api_returns_true_when_port_opens(self, monkeypatch):
         """Simulate port closed on first probe, open on second."""

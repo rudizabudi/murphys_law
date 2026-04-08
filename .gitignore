@@ -7,8 +7,11 @@ wheels/
 *.egg-info
 data/
 state/
+logs/
 
 # Virtual environments
 .venv
 
 config.py
+ib_exec.py
+tester.py

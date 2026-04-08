@@ -29,6 +29,8 @@ Usage
 """
 
 import logging
+import threading
+import time
 from datetime import date, datetime, timedelta
 
 import pandas_market_calendars as mcal
@@ -112,6 +114,12 @@ def _market_guard(job_name: str) -> dict | None:
 
 def job_connectivity_check() -> None:
     # No calendar gate — runs every weekday regardless of trading day
+    if not main.bridge.is_connected():
+        logger.warning("[scheduler] job_connectivity_check: bridge not connected — calling connect()")
+        try:
+            main.bridge.connect()
+        except Exception as exc:
+            logger.critical("[scheduler] job_connectivity_check: connect() failed: %s", exc)
     main.connectivity_check()
 
 
@@ -205,6 +213,57 @@ def market_open_check() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Connection watchdog
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def connection_watchdog() -> None:
+    """
+    Daemon thread — blocks on bridge._disconnect_event and reconnects immediately
+    when IB fires connectionClosed().
+
+    Retry policy: up to 3 attempts at 10-second intervals.
+    On all retries exhausted: critical alert via monitor.send_alert().
+    On success: clears the disconnect event and loops back to waiting.
+    """
+    _MAX_RETRIES   = 3
+    _RETRY_DELAY_S = 10
+
+    logger.info("[watchdog] connection_watchdog started")
+
+    while True:
+        main.bridge.wait_for_disconnect()
+        logger.warning("[watchdog] disconnect detected — attempting reconnect")
+
+        connected = False
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                main.bridge.connect()
+                logger.info("[watchdog] reconnect succeeded (attempt %d)", attempt)
+                connected = True
+                break
+            except Exception as exc:
+                logger.warning(
+                    "[watchdog] reconnect attempt %d/%d failed: %s",
+                    attempt, _MAX_RETRIES, exc,
+                )
+                if attempt < _MAX_RETRIES:
+                    time.sleep(_RETRY_DELAY_S)
+
+        if connected:
+            main.bridge.clear_disconnect()
+        else:
+            logger.critical("[watchdog] all %d reconnect attempts failed", _MAX_RETRIES)
+            monitor.send_alert(
+                "IB reconnect FAILED",
+                f"connectionClosed() detected and all {_MAX_RETRIES} reconnect attempts "
+                f"failed. Manual intervention required.",
+                level="critical",
+            )
+            # Reset the event so the watchdog can detect the next disconnect
+            main.bridge.clear_disconnect()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Scheduler factory
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -281,6 +340,23 @@ def build_scheduler() -> BlockingScheduler:
 
 if __name__ == "__main__":
     monitor.setup_logging()
+
+    logger.info("[scheduler] Connecting to IB TWS/Gateway")
+    try:
+        main.bridge.connect()
+        logger.info("[scheduler] IB connection established")
+    except Exception as exc:
+        logger.critical("[scheduler] Failed to connect to IB: %s — aborting", exc)
+        raise SystemExit(1)
+
+    watchdog = threading.Thread(
+        target=connection_watchdog,
+        daemon=True,
+        name="ib-watchdog",
+    )
+    watchdog.start()
+    logger.info("[scheduler] connection_watchdog thread started")
+
     logger.info("[scheduler] Starting Murphy's Law scheduler")
     logger.info("[scheduler] Timezone: %s", config.TZ)
     logger.info("[scheduler] Fixed jobs:")
