@@ -8,6 +8,7 @@ wheels/
 data/
 state/
 logs/
+.idea/
 
 # Virtual environments
 .venv

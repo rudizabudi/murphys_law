@@ -779,6 +779,21 @@ def fill_reconciliation() -> None:
     non_split_positions = [p for p in positions_now if p["symbol"] not in split_symbols]
     mismatch, detail = _reconcile_with_ib(non_split_positions, ib_pos)
     if mismatch:
+        if config.RISK_RECONCILE_HALT:
+            alert_body = (
+                f"A TRADING HALT has been set. Trading is suspended until manually "
+                f"cleared via risk_engine.clear_halt().\n\nMismatch detail:\n{detail}"
+            )
+        else:
+            alert_body = (
+                f"RISK_RECONCILE_HALT is False — no trading halt set. "
+                f"Manual review recommended.\n\nMismatch detail:\n{detail}"
+            )
+        monitor.send_alert(
+            subject="🚨 TRADING HALT — Position Reconciliation Mismatch",
+            body=alert_body,
+            level="critical",
+        )
         risk_engine.evaluate("reconcile_mismatch", {"mismatch": True, "detail": detail})
         logger.warning("[main] fill_reconciliation: IB mismatch — %s", detail)
 
@@ -949,6 +964,22 @@ def sunday_universe_update() -> None:
         body="\n".join(body_lines),
         level="info",
     )
+
+    # Record completion time so startup_catchup() can detect stale universe.
+    try:
+        p = db.ph()
+        with db.connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS system_state "
+                "(key TEXT PRIMARY KEY, value TEXT)"
+            )
+            conn.execute(
+                f"INSERT OR REPLACE INTO system_state (key, value) VALUES ({p}, {p})",
+                ("last_universe_update", datetime.now(config.TZ).isoformat()),
+            )
+    except Exception as exc:
+        logger.warning("[main] sunday_universe_update: could not write last_universe_update: %s", exc)
+
     logger.info("[main] sunday_universe_update: complete")
 
 

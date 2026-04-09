@@ -28,6 +28,7 @@ Order dataclass
   Defined here; imported by order_manager.py when that module is built.
 """
 
+import httpx
 import logging
 import queue
 import socket
@@ -112,48 +113,27 @@ class Order:
 
 class IBCController:
     """
-    Thin wrapper around IBC shell commands.
+    Interacts with tws_controller_api.
 
-    Uses IBC's actual script interface:
-      gatewaystart.sh / twsstart.sh  — launch Gateway or TWS (selected by IBC_MODE)
-      commandsend.sh stop            — gracefully stop a running instance
-
-    Calling convention for start scripts (IBC >= 3.x):
-      <start-script> <ib-dir> <ibc-config-ini> <tws-version>
-    The tws-version argument is passed as an empty string here; IBC will use
-    the version configured in config.ini when the argument is omitted or blank.
     """
 
     def stop_gateway(self) -> None:
-        """Send a graceful stop command to the running IBC instance via commandsend.sh."""
-        logger.info("[ibc] Stopping Gateway via IBC commandsend.sh stop.")
-        subprocess.run(
-            [config.IBC_COMMAND_SEND, "stop"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        logger.info("[ibc] Stopping IBC.")
+        resp = httpx.get(f"http://{config.IBC_CONTROLLER_HOST}:{config.IBC_CONTROLLER_PORT}/stop-api")
+        if resp.status_code != 200:
+            logger.error("[ibc] unable to connect to tws_controller_api.")           
+
+
 
     def start_gateway(self) -> None:
         """
-        Launch IB Gateway (or TWS) through IBC.
-
-        Uses config.IBC_GATEWAY_START when IBC_MODE == "gateway",
-        otherwise config.IBC_TWS_START.  Handles 2FA automatically
-        via TwsLoginMode in config.IBC_CONFIG_PATH.
+        Launch IBC.
         """
-        start_script = (
-            config.IBC_GATEWAY_START
-            if config.IBC_MODE == "gateway"
-            else config.IBC_TWS_START
-        )
-        logger.info("[ibc] Starting %s via IBC: %s", config.IBC_MODE, start_script)
-        subprocess.run(
-            [start_script, config.IBC_DIR, config.IBC_CONFIG_PATH, ""],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        logger.info("[ibc] Starting IBC.")
+        resp = httpx.get(f"http://{config.IBC_CONTROLLER_HOST}:{config.IBC_CONTROLLER_PORT}/start-api")
+        if resp.status_code != 200:
+            logger.error("[ibc] unable to connect to tws_controller_api.")           
+
 
     def wait_for_api(self, timeout: int = 120) -> bool:
         """
@@ -397,6 +377,7 @@ def submit_order(bridge: IBBridge, order: Order) -> int:
     ib_order.firmQuoteOnly = False
     ib_order.action        = order.action
     ib_order.totalQuantity = order.quantity
+    ib_order.orderRef = f"{config.STRATEGY}_v{config.VERSION}"
 
     if order.order_type == "LOC":
         ib_order.orderType = "LMT"

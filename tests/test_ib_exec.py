@@ -83,29 +83,51 @@ def _make_bridge_stub() -> IBBridge:
 
 class TestIBCController:
 
-    def test_stop_gateway_calls_subprocess(self):
-        ctrl = IBCController()
-        with patch("subprocess.run") as mock_run:
-            ctrl.stop_gateway()
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]   # first positional arg = command list
-        assert args[0] == config.IBC_COMMAND_SEND
-        assert "stop" in args
+    def _mock_resp(self, status_code: int = 200):
+        m = MagicMock()
+        m.status_code = status_code
+        return m
 
-    def test_start_gateway_calls_subprocess(self):
+    def test_start_gateway_calls_start_api(self):
         ctrl = IBCController()
-        with patch("subprocess.run") as mock_run:
+        with patch("httpx.get", return_value=self._mock_resp(200)) as mock_get:
             ctrl.start_gateway()
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]
-        expected_script = (
-            config.IBC_GATEWAY_START
-            if config.IBC_MODE == "gateway"
-            else config.IBC_TWS_START
-        )
-        assert args[0] == expected_script
-        assert config.IBC_DIR in args
-        assert config.IBC_CONFIG_PATH in args
+        mock_get.assert_called_once()
+        url = mock_get.call_args[0][0]
+        assert "/start-api" in url
+
+    def test_start_gateway_url_has_http_scheme(self):
+        ctrl = IBCController()
+        with patch("httpx.get", return_value=self._mock_resp(200)) as mock_get:
+            ctrl.start_gateway()
+        url = mock_get.call_args[0][0]
+        assert url.startswith("http://")
+
+    def test_stop_gateway_calls_stop_api(self):
+        ctrl = IBCController()
+        with patch("httpx.get", return_value=self._mock_resp(200)) as mock_get:
+            ctrl.stop_gateway()
+        mock_get.assert_called_once()
+        url = mock_get.call_args[0][0]
+        assert "/stop-api" in url
+
+    def test_stop_gateway_non_200_logs_error(self, caplog):
+        import logging
+        ctrl = IBCController()
+        with patch("httpx.get", return_value=self._mock_resp(500)):
+            with caplog.at_level(logging.ERROR, logger="murphy"):
+                ctrl.stop_gateway()
+        assert any("unable to connect" in r.message.lower() or "error" in r.levelname.lower()
+                   for r in caplog.records)
+
+    def test_start_gateway_non_200_logs_error(self, caplog):
+        import logging
+        ctrl = IBCController()
+        with patch("httpx.get", return_value=self._mock_resp(500)):
+            with caplog.at_level(logging.ERROR, logger="murphy"):
+                ctrl.start_gateway()
+        assert any("unable to connect" in r.message.lower() or "error" in r.levelname.lower()
+                   for r in caplog.records)
 
     def test_wait_for_api_returns_true_when_port_opens(self, monkeypatch):
         """Simulate port closed on first probe, open on second."""

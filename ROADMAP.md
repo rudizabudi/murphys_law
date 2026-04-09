@@ -276,6 +276,8 @@ IB_PORT                   = 7496        # 7497 for paper trading
 IB_CLIENT_ID              = 1
 IB_SUBACCOUNT             = ""          # Subaccount ID (e.g. "DU1234567"); empty = use master account
 IB_HEARTBEAT_TIMEOUT_SEC  = 5           # Seconds to wait for reqCurrentTime response in heartbeat()
+IB_RECONNECT_INTERVAL_SEC = 30          # Seconds between reconnect attempts in connection_watchdog
+IB_RECONNECT_ALERT_AFTER  = 10         # Send warning alert after this many failed reconnect attempts
 
 # ── IB error codes ──────────────────────────────────────────────────────────────
 IB_SOFT_ERROR_CODES       = [2104, 2106, 2107, 2108, 2158]   # Informational; logged at DEBUG, never stored
@@ -283,12 +285,8 @@ IB_REJECTION_CODES        = [201, 202, 203, 321, 322]         # Hard order rejec
 
 # ── IBC (automated TWS/Gateway login) ──────────────────────────────────────────
 IBC_MODE              = "gateway"          # "gateway" | "tws"
-IBC_DIR               = "/opt/ibc"         # IBC installation directory
-IBC_GATEWAY_START     = "/opt/ibc/gatewaystart.sh"
-IBC_TWS_START         = "/opt/ibc/twsstart.sh"
-IBC_COMMAND_SEND      = "/opt/ibc/commandsend.sh"
-IBC_TWS_PATH          = "/opt/Trader Workstation"
-IBC_CONFIG_PATH       = "/opt/ibc/config.ini"
+IBC_CONTROLLER_HOST   = "127.0.0.1"       # tws_controller_api host
+IBC_CONTROLLER_PORT   = 8123              # tws_controller_api port
 IBC_2FA_DAY           = "sunday"
 IBC_2FA_TIME          = "18:00"
 IBC_RESTART_TIMEOUT   = 120               # Seconds to wait for TWS/Gateway restart
@@ -303,6 +301,7 @@ SCHED_SIGNAL_OFFSET_MIN     = -20       # signal_snap:         close − 20 min 
 SCHED_ORDER_OFFSET_MIN      = -16       # order_submission:    close − 16 min  (normal: 15:44 ET)
 SCHED_FILL_OFFSET_MIN       = +10       # fill_reconciliation: close + 10 min  (normal: 16:10 ET)
 SCHED_REPORT_OFFSET_MIN     = +15       # daily_report:        close + 15 min  (normal: 16:15 ET)
+SCHED_MIN_LEAD_MINS         = 5         # Jobs with less than this many minutes of lead time are skipped
 
 # ── Half-day calendar fallback ──────────────────────────────────────────────────
 HALF_DAY_DATES: list[str] = [
@@ -320,6 +319,7 @@ EXIT_ORDER_TYPE           = "MOC"       # Keep exits as MOC — non-execution ri
 TWELVEDATA_API_KEY            = "YOUR_KEY_HERE"
 TWELVEDATA_INCREMENTAL_DAYS   = 5           # Normal nightly lookback (fetch_bars per-symbol path)
 TWELVEDATA_HISTORY_DAYS       = 550         # Full history depth for new symbols (~252 bars + buffer)
+TWELVEDATA_BATCH_SIZE         = 8           # Symbols per HTTP request; free tier = 8, paid plans support higher values
 TWELVEDATA_RATE_LIMIT_PER_MIN = 8           # Free tier: 8 credits/min. Paid plans support higher limits. Each symbol in a batch = 1 credit.
 UNIVERSE_CSV                  = "state/universe.csv"
 
@@ -387,7 +387,8 @@ RISK_FILL_TIMEOUT_MINS          = 30
 RISK_FILL_TIMEOUT_ACTION        = ["notify"]
 
 RISK_RECONCILE_ENABLED          = True
-RISK_RECONCILE_ACTION           = ["halt", "notify"]
+RISK_RECONCILE_HALT             = False      # Set True to halt on mismatch; False for notify-only (safe default for multi-strategy / paper accounts)
+RISK_RECONCILE_ACTION           = ["notify"] # Change to ["halt", "notify"] when RISK_RECONCILE_HALT=True
 
 RISK_IMBALANCE_ENABLED          = False     # Optional; disabled by default
 RISK_IMBALANCE_THRESHOLD        = 0.3
@@ -464,6 +465,8 @@ python migrate.py
 
 For each symbol in `universe.csv`, request the last few days of daily bars from TwelveData and upsert into `daily_bars`. After the DB update, trigger `precompute_watchlist()`.
 
+Symbols are batched into HTTP requests of `config.TWELVEDATA_BATCH_SIZE` symbols each (default 8, matching the free-tier credit limit per request). The inter-batch delay is computed at call time as `(TWELVEDATA_BATCH_SIZE / TWELVEDATA_RATE_LIMIT_PER_MIN) * 60` seconds so that credit consumption stays within the per-minute cap. Both values are configurable — raise `TWELVEDATA_BATCH_SIZE` and `TWELVEDATA_RATE_LIMIT_PER_MIN` together on a paid plan.
+
 #### 4.2.4 Watchlist Precompute (runs immediately after nightly sync)
 
 After the DB is updated, evaluate all price-independent entry conditions across the full universe:
@@ -516,6 +519,7 @@ def get_new_symbols() -> list[str]:
 - Fires at `config.SP500_UPDATE_TIME` (default 17:00 ET) on `config.SP500_UPDATE_DAY` (default Sunday)
 - Runs **before** `sunday_reauth` at `IBC_2FA_TIME` (default 18:00 ET) so any newly added symbols are visible to the next nightly sync
 - No NYSE calendar gate — fires every configured Sunday regardless of trading day
+- After completing, writes `last_universe_update = <now ISO>` to the `system_state` SQLite table so that `startup_catchup()` can detect a stale universe if the scheduler was offline for more than 7 days
 
 **Full vs incremental history fetch:**
 - **Incremental** (nightly, `TWELVEDATA_INCREMENTAL_DAYS = 5`): every symbol in `universe.csv` gets the last 5 days upserted into `daily_bars` during `nightly_sync()`
@@ -669,7 +673,9 @@ def export_positions_json()                             # Only if EXPORT_STATE_J
 
 #### 4.5.3 IB Reconciliation & Alerting
 
-At 16:10 ET, live IB positions are compared against the `positions` table. Any discrepancy halts the next day's order submission until manually resolved and routes through `send_alert()`.
+At 16:10 ET, live IB positions are compared against the `positions` table. When a discrepancy is found, `fill_reconciliation()` always fires a prominent **critical** `monitor.send_alert()` with subject `"🚨 TRADING HALT — Position Reconciliation Mismatch"` directly — regardless of the risk engine action list. The body states whether a halt was set (governed by `RISK_RECONCILE_HALT`) and includes the full mismatch detail. `risk_engine.evaluate("reconcile_mismatch", ...)` is then called as a second step to execute the configured action (`RISK_RECONCILE_ACTION`).
+
+**Default behaviour (`RISK_RECONCILE_HALT = False`):** The alert fires at critical level but no trading halt is set. This is the safe default for multi-strategy or paper accounts where an IB position mismatch may originate from a separate manual trade and should not suspend the whole system automatically. Set `RISK_RECONCILE_HALT = True` and `RISK_RECONCILE_ACTION = ["halt", "notify"]` to restore the halt-on-mismatch behaviour.
 
 The alert interface in `monitor.py` is a single dispatcher. All risk controls, reconciliation mismatches, fill failures, and circuit breakers call only `send_alert()`. Adding a new channel means adding one `_send_*` function and one `if config.X` line — nothing else changes.
 
@@ -781,10 +787,10 @@ Two layers of connection management:
 
 ```python
 class IBCController:
-    """Thin wrapper around IBC shell commands."""
-    def stop_gateway(self): ...     # commandsend.sh stop — sends stop to running IBC instance
-    def start_gateway(self): ...    # gatewaystart.sh (IBC_MODE="gateway") or twsstart.sh (IBC_MODE="tws")
-    def wait_for_api(self, timeout: int) -> bool: ...  # Poll IB_PORT until open
+    """HTTP client for the tws_controller_api service."""
+    def stop_gateway(self): ...     # GET http://IBC_CONTROLLER_HOST:IBC_CONTROLLER_PORT/stop-api
+    def start_gateway(self): ...    # GET http://IBC_CONTROLLER_HOST:IBC_CONTROLLER_PORT/start-api
+    def wait_for_api(self, timeout: int) -> bool: ...  # Poll IB_PORT until open (unchanged)
 
 class IBBridge:
     def connect(self): ...
@@ -795,13 +801,22 @@ class IBBridge:
     def clear_disconnect(self): ...    # resets the event for the next disconnect cycle
 ```
 
-**Disconnect event mechanism:** `IBBridge._disconnect_event` is a `threading.Event` initialised in `__init__`. The `connectionClosed()` EWrapper callback (fired by ibapi when the TCP connection is lost) calls `_disconnect_event.set()`. `wait_for_disconnect()` blocks on this event; `clear_disconnect()` resets it. The `connection_watchdog()` daemon thread in `scheduler.py` blocks on `wait_for_disconnect()` and reconnects immediately when the event fires — up to 3 retries at 10-second intervals, critical alert if all fail.
+**Disconnect event mechanism:** `IBBridge._disconnect_event` is a `threading.Event` initialised in `__init__`. The `connectionClosed()` EWrapper callback (fired by ibapi when the TCP connection is lost) calls `_disconnect_event.set()`. `wait_for_disconnect()` blocks on this event; `clear_disconnect()` resets it.
+
+**`connection_watchdog()` daemon thread** (in `scheduler.py`):
+1. Blocks on `wait_for_disconnect()` — returns when `connectionClosed()` fires.
+2. Calls `clear_disconnect()` immediately so any subsequent disconnect during the retry loop can be detected on the next outer iteration.
+3. Enters an indefinite retry loop: sleep `IB_RECONNECT_INTERVAL_SEC` seconds, then call `bridge.connect()`.
+4. After `IB_RECONNECT_ALERT_AFTER` consecutive failures sends a **warning** alert once: *"IB connection lost — N reconnect attempts failed, retrying every Xs"*.
+5. On success: logs INFO. If a warning alert was sent, sends a recovery **info** alert: *"IB connection restored after N attempt(s)"*.
+6. Calls `_post_reconnect_catchup()` to re-register any intraday jobs missed during the outage.
+7. Loops back to step 1.
 
 **Sunday reauth job** (runs at `IBC_2FA_TIME` every `IBC_2FA_DAY`):
-1. `IBCController.stop_gateway()` — runs `commandsend.sh stop` to gracefully shut down the running instance
+1. `IBCController.stop_gateway()` — `GET /stop-api` on the `tws_controller_api` service; non-200 response logged at ERROR
 2. Wait for process to terminate
-3. `IBCController.start_gateway()` — runs `gatewaystart.sh` (or `twsstart.sh` if `IBC_MODE="tws"`), passing `IBC_DIR` and `IBC_CONFIG_PATH`; IBC handles 2FA automatically via `TwsLoginMode` in config.ini
-4. `IBCController.wait_for_api(IBC_RESTART_TIMEOUT)` — poll until API port responds
+3. `IBCController.start_gateway()` — `GET /start-api` on the `tws_controller_api` service; non-200 response logged at ERROR
+4. `IBCController.wait_for_api(IBC_RESTART_TIMEOUT)` — poll `IB_HOST:IB_PORT` until the TCP port accepts connections (unchanged)
 5. `IBBridge.reconnect()`
 6. `send_alert()` with success or failure
 
@@ -875,7 +890,7 @@ Uses APScheduler `BlockingScheduler` with `timezone=config.TZ`. All jobs anchore
 
 | Thread | Name | Description |
 |---|---|---|
-| `connection_watchdog` | `ib-watchdog` | Blocks on `bridge.wait_for_disconnect()`; on disconnect attempts `bridge.connect()` up to 3 times at 10-second intervals; critical alert if all retries fail; resets the event and loops |
+| `connection_watchdog` | `ib-watchdog` | Blocks on `bridge.wait_for_disconnect()`; on disconnect retries indefinitely at `IB_RECONNECT_INTERVAL_SEC`-second intervals; warning alert after `IB_RECONNECT_ALERT_AFTER` failures; recovery info alert on success; calls `_post_reconnect_catchup()` |
 
 #### Fixed cron triggers (registered at startup)
 
@@ -887,9 +902,46 @@ Uses APScheduler `BlockingScheduler` with `timezone=config.TZ`. All jobs anchore
 | `nightly_sync` | Mon–Fri `TIME_NIGHTLY_SYNC` | NYSE | TwelveData incremental bar update → `precompute_watchlist()` |
 | `market_open_check` | Mon–Fri 11:00 | NYSE | Determine close time; register four intraday DateTrigger jobs |
 
+#### Startup halt warning (`_startup_halt_warning()`)
+
+Called once at startup after the IB connection is established (before `build_scheduler()`). If `risk_engine.is_halted()` or `risk_engine.is_shutdown()` returns True:
+- Logs at `CRITICAL` with the active state (HALT or SHUTDOWN).
+- Sends a critical `monitor.send_alert()` with subject `"⚠️ Murphy's Law started with HALT/SHUTDOWN active"` and a body explaining that trading is suspended and `risk_engine.clear_halt()` is required to resume.
+- Does **not** abort startup — all data maintenance jobs (nightly sync, universe update) continue running regardless.
+
+#### Startup catch-up (`startup_catchup()`)
+
+`startup_catchup()` is called once at scheduler startup (after `build_scheduler()`). It handles three scenarios that arise when the scheduler is (re)started mid-day or after a gap:
+
+1. **Same-day intraday catch-up** — If today is a trading day and the current time is between 11:00 ET (when `market_open_check` normally fires) and `fill_reconciliation` time (`close_time + SCHED_FILL_OFFSET_MIN`), `market_open_check()` is called immediately so any remaining intraday jobs are registered for today. Jobs whose `run_time` is less than `SCHED_MIN_LEAD_MINS` away are automatically skipped by `market_open_check()`, so there is no risk of scheduling already-missed jobs.
+
+2. **Stale universe catch-up** — Reads `last_universe_update` from the `system_state` SQLite table (key-value store, `CREATE TABLE IF NOT EXISTS`). If the value is absent or older than 7 days, `main.sunday_universe_update()` is called immediately.
+
+3. **Nightly data catch-up** — Queries `MAX(date)` from `daily_bars`. Determines the last passed NYSE market close date using `pandas_market_calendars` (filters to sessions whose `market_close` UTC timestamp has already elapsed). If `MAX(date) < last_close_date`, computes `gap_days = (today − MAX(date)).days` and calls `td_data.fetch_incremental(symbols, n_days=gap_days + 2)` (the `+2` provides an overlap buffer). After the fetch, calls `main.precompute_watchlist()` so the watchlist reflects the freshly updated data. Logs: `"startup catch-up sync: DB last date=…, last market close=…, fetching N days"`. If `MAX(date)` already matches the last close, logs at DEBUG and skips.
+
+#### Post-reconnect catch-up (`_post_reconnect_catchup()`)
+
+Called by `connection_watchdog()` immediately after each successful reconnect. Determines which intraday jobs were missed during the outage and re-registers them:
+
+- If a job's `run_time` is still `>= SCHED_MIN_LEAD_MINS` in the future → schedule at the natural `run_time` (same as `market_open_check` would).
+- If a job's `run_time` has already passed but it is still worth running → schedule immediately (`now + 5 s`).
+
+**Sequencing rules** (a job is worth running only if its successor has not already fired):
+
+| Job | Worth running if… |
+|---|---|
+| `signal_snap` | `now < t_order` (order_submission time has not passed) |
+| `order_submission` | `now < t_fill` (fill_reconciliation time has not passed) |
+| `fill_reconciliation` | same calendar day as `close_time` (before midnight ET) |
+| `daily_report` | same calendar day as `close_time` (before midnight ET) |
+
+On a non-trading day the function returns immediately with no jobs scheduled.
+
 #### Dynamically registered intraday jobs (DateTrigger, one-off)
 
 The four intraday jobs are **not** fixed cron triggers. At 11:00 ET, `market_open_check()` calls `get_market_schedule()` to obtain today's `close_time`, then registers each job as a one-off `DateTrigger` at `close_time + timedelta(minutes=SCHED_*_OFFSET_MIN)`. All four jobs are registered with `replace_existing=True`, making the 11:00 call idempotent if it fires more than once in a session.
+
+Jobs whose `run_time − now < SCHED_MIN_LEAD_MINS` are silently skipped (logged at INFO). This applies both at the normal 11:00 ET fire and during `startup_catchup()` when the scheduler starts late in the day.
 
 | Job | Config param | Default | Normal day (close 16:00) | Half day (close 13:00) |
 |---|---|---|---|---|
@@ -1089,7 +1141,7 @@ Every scheduler job passes its context through `evaluate()` before proceeding. A
 | Consecutive losing days | `RISK_CONSEC_LOSS_DAYS` | notify |
 | Consecutive losing trades | `RISK_CONSEC_LOSS_TRADES` | notify |
 | Order fill timeout | `RISK_FILL_TIMEOUT_MINS` | notify |
-| State reconciliation mismatch | — | halt, notify |
+| State reconciliation mismatch | `RISK_RECONCILE_HALT` | notify (default); set `RISK_RECONCILE_HALT=True` and `RISK_RECONCILE_ACTION=["halt","notify"]` to halt |
 | Imbalance filter (optional) | `RISK_IMBALANCE_THRESHOLD` | reject |
 
 See `config.py` in Section 4.1 for full parameter definitions.

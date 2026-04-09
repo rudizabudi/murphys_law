@@ -289,6 +289,16 @@ class TestControlThresholds:
         monkeypatch.setattr(config, "RISK_RECONCILE_ACTION", ["halt"])
         assert evaluate("reconcile_mismatch", {"mismatch": False}) is True
 
+    @patch("monitor.send_alert")
+    def test_reconcile_mismatch_notify_only_when_halt_disabled(self, mock_alert, monkeypatch):
+        """RISK_RECONCILE_HALT=False (notify-only): alert fires, no halt set, returns True."""
+        monkeypatch.setattr(config, "RISK_RECONCILE_HALT",   False)
+        monkeypatch.setattr(config, "RISK_RECONCILE_ACTION", ["notify"])
+        result = evaluate("reconcile_mismatch", {"mismatch": True})
+        mock_alert.assert_called_once()
+        assert result is True
+        assert is_halted() is False
+
     # ── imbalance ─────────────────────────────────────────────────────────────
 
     def test_imbalance_trips_at_threshold(self, monkeypatch):

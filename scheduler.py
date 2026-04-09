@@ -29,6 +29,7 @@ Usage
 """
 
 import logging
+import subprocess
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -39,8 +40,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 import config
+import db
 import main
 import monitor
+import risk_engine
+import td_data
 
 logger = logging.getLogger("murphy")
 
@@ -195,12 +199,21 @@ def market_open_check() -> None:
     t_fill   = close_time + timedelta(minutes=config.SCHED_FILL_OFFSET_MIN)
     t_report = close_time + timedelta(minutes=config.SCHED_REPORT_OFFSET_MIN)
 
+    now      = datetime.now(config.TZ)
+    min_lead = timedelta(minutes=config.SCHED_MIN_LEAD_MINS)
+
     for fn, job_id, name, run_time, grace in [
         (job_signal_snap,         "signal_snap",         "IB snapshot + signal evaluation",    t_signal, 120),
         (job_order_submission,    "order_submission",    "LOC/MOC order submission",            t_order,   60),
         (job_fill_reconciliation, "fill_reconciliation", "Fill confirmation + position update", t_fill,   300),
         (job_daily_report,        "daily_report",        "Daily / weekly report",               t_report, 300),
     ]:
+        if run_time - now < min_lead:
+            logger.info(
+                "[scheduler] %s: skipped — run_time %s is less than %d min away",
+                job_id, run_time.strftime("%H:%M"), config.SCHED_MIN_LEAD_MINS,
+            )
+            continue
         _scheduler.add_job(
             fn,
             DateTrigger(run_date=run_time, timezone=config.TZ),
@@ -213,54 +226,302 @@ def market_open_check() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Startup helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _startup_halt_warning() -> None:
+    """
+    Called once at startup after the IB connection is established.
+
+    If a halt or shutdown flag is active in the DB, logs at CRITICAL and sends
+    a warning alert.  Does NOT abort startup — data maintenance jobs continue
+    running regardless.
+    """
+    halted   = risk_engine.is_halted()
+    shutdown = risk_engine.is_shutdown()
+    if halted or shutdown:
+        state = "SHUTDOWN" if shutdown else "HALT"
+        logger.critical(
+            "[scheduler] STARTED WITH %s ACTIVE — trading suspended; "
+            "call risk_engine.clear_halt() to resume",
+            state,
+        )
+        monitor.send_alert(
+            subject="⚠️ Murphy's Law started with HALT/SHUTDOWN active",
+            body=(
+                f"{state} flag is active in the DB. Trading is suspended. "
+                f"Data maintenance jobs (nightly sync, universe update) will continue "
+                f"running. Call risk_engine.clear_halt() to resume trading."
+            ),
+            level="critical",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Startup catch-up
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_UNIVERSE_STALE_DAYS = 7  # trigger a catch-up update if last run was older than this
+
+
+def startup_catchup() -> None:
+    """
+    Run once at scheduler startup (before sched.start()).  Handles two scenarios:
+
+    1. Same-day intraday catch-up:
+       If today is a trading day and the current time is past 11:00 ET (when
+       market_open_check normally fires) but before fill_reconciliation time,
+       call market_open_check() immediately so any remaining intraday jobs are
+       registered for today.
+
+    2. Stale universe catch-up:
+       Read last_universe_update from the system_state table.  If the value is
+       absent or older than _UNIVERSE_STALE_DAYS days, call
+       main.sunday_universe_update() immediately.
+    """
+    now = datetime.now(config.TZ)
+    logger.info("[startup_catchup] running at %s ET", now.strftime("%Y-%m-%d %H:%M"))
+
+    # ── Market catch-up ───────────────────────────────────────────────────────
+    sched = get_market_schedule()
+    if sched["is_open"]:
+        close_time = sched["close_time"]
+        t_check = datetime(now.year, now.month, now.day, 11, 0, tzinfo=config.TZ)
+        t_fill  = close_time + timedelta(minutes=config.SCHED_FILL_OFFSET_MIN)
+
+        if t_check <= now < t_fill:
+            logger.info(
+                "[startup_catchup] started after 11:00 ET on trading day — calling market_open_check()"
+            )
+            market_open_check()
+        else:
+            logger.info(
+                "[startup_catchup] market catch-up not needed (now=%s, window 11:00–%s)",
+                now.strftime("%H:%M"), t_fill.strftime("%H:%M"),
+            )
+    else:
+        logger.info("[startup_catchup] not a trading day — skipping market catch-up")
+
+    # ── Universe catch-up ─────────────────────────────────────────────────────
+    last_update: datetime | None = None
+    try:
+        with db.connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS system_state "
+                "(key TEXT PRIMARY KEY, value TEXT)"
+            )
+            row = conn.execute(
+                "SELECT value FROM system_state WHERE key = 'last_universe_update'"
+            ).fetchone()
+            if row:
+                last_update = datetime.fromisoformat(row[0])
+    except Exception as exc:
+        logger.warning("[startup_catchup] could not read system_state: %s", exc)
+
+    if last_update is None or (now - last_update).days >= _UNIVERSE_STALE_DAYS:
+        reason = "absent" if last_update is None else f"last={last_update.date()}"
+        logger.info(
+            "[startup_catchup] universe update stale or absent (%s) — running sunday_universe_update()",
+            reason,
+        )
+        main.sunday_universe_update()
+    else:
+        logger.info("[startup_catchup] universe up to date (last=%s)", last_update.date())
+
+    # ── Nightly data catch-up ─────────────────────────────────────────────────
+    max_bar_date = None
+    try:
+        with db.connect() as conn:
+            row = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
+            if row and row[0]:
+                max_bar_date = row[0]
+    except Exception as exc:
+        logger.warning("[startup_catchup] could not read MAX(date) from daily_bars: %s", exc)
+
+    last_close_date = None
+    try:
+        look_back = _nyse.schedule(
+            start_date=(now.date() - timedelta(days=10)).isoformat(),
+            end_date=now.date().isoformat(),
+        )
+        if not look_back.empty:
+            closes        = look_back["market_close"].dt.tz_convert(config.TZ)
+            past_sessions = look_back[closes < now]
+            if not past_sessions.empty:
+                last_close_date = past_sessions.index[-1].date()
+    except Exception as exc:
+        logger.warning("[startup_catchup] could not determine last NYSE close: %s", exc)
+
+    if max_bar_date is not None and last_close_date is not None:
+        from datetime import date as _date
+        max_date = (
+            _date.fromisoformat(max_bar_date)
+            if isinstance(max_bar_date, str)
+            else max_bar_date
+        )
+        if max_date < last_close_date:
+            gap_days = (now.date() - max_date).days
+            n_days   = gap_days + 2
+            symbols  = main._load_universe()
+            logger.info(
+                "[startup_catchup] startup catch-up sync: DB last date=%s, "
+                "last market close=%s, fetching %d days",
+                max_date, last_close_date, n_days,
+            )
+            try:
+                td_data.fetch_incremental(symbols, n_days=n_days)
+                main.precompute_watchlist()
+            except Exception as exc:
+                logger.warning("[startup_catchup] catch-up sync failed: %s", exc)
+        else:
+            logger.debug("[startup_catchup] DB is current (last date=%s)", max_bar_date)
+    else:
+        logger.debug(
+            "[startup_catchup] skipping data catch-up (max_bar_date=%s, last_close=%s)",
+            max_bar_date, last_close_date,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Post-reconnect catch-up
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _post_reconnect_catchup() -> None:
+    """
+    Called by connection_watchdog() immediately after a successful reconnect.
+
+    Inspects current time against today's scheduled intraday job times and either:
+      • schedules the job at its natural run_time if still in the future, or
+      • schedules it immediately (now + 5 s) if its window has passed but it is
+        still worth running.
+
+    Sequencing rules
+    ─────────────────
+      signal_snap         skipped if order_submission time has already passed
+      order_submission    skipped if fill_reconciliation time has already passed
+      fill_reconciliation always run if still the same trading day (before midnight ET)
+      daily_report        always run if still the same trading day (before midnight ET)
+
+    On a non-trading day the function returns immediately with no jobs scheduled.
+    """
+    sched = get_market_schedule()
+    if not sched["is_open"]:
+        logger.info("[watchdog] _post_reconnect_catchup: not a trading day — nothing to catch up")
+        return
+
+    now        = datetime.now(config.TZ)
+    close_time = sched["close_time"]
+
+    t_signal = close_time + timedelta(minutes=config.SCHED_SIGNAL_OFFSET_MIN)
+    t_order  = close_time + timedelta(minutes=config.SCHED_ORDER_OFFSET_MIN)
+    t_fill   = close_time + timedelta(minutes=config.SCHED_FILL_OFFSET_MIN)
+    t_report = close_time + timedelta(minutes=config.SCHED_REPORT_OFFSET_MIN)
+
+    min_lead = timedelta(minutes=config.SCHED_MIN_LEAD_MINS)
+    same_day = now.date() == close_time.date()
+
+    # (fn, job_id, name, run_time, grace, worth_running)
+    jobs = [
+        (job_signal_snap,         "signal_snap",         "IB snapshot + signal evaluation",    t_signal, 120, now < t_order),
+        (job_order_submission,    "order_submission",    "LOC/MOC order submission",            t_order,   60, now < t_fill),
+        (job_fill_reconciliation, "fill_reconciliation", "Fill confirmation + position update", t_fill,   300, same_day),
+        (job_daily_report,        "daily_report",        "Daily / weekly report",               t_report, 300, same_day),
+    ]
+
+    for fn, job_id, name, run_time, grace, worth_running in jobs:
+        if not worth_running:
+            logger.info(
+                "[watchdog] _post_reconnect_catchup: %s skipped — too late in sequence or not same day",
+                job_id,
+            )
+            continue
+
+        if run_time - now >= min_lead:
+            # Job time is still in the future — schedule at natural time
+            _scheduler.add_job(
+                fn,
+                DateTrigger(run_date=run_time, timezone=config.TZ),
+                id=job_id,
+                name=name,
+                misfire_grace_time=grace,
+                replace_existing=True,
+            )
+            logger.info(
+                "[watchdog] _post_reconnect_catchup: %s scheduled at %s ET",
+                job_id, run_time.strftime("%H:%M"),
+            )
+        else:
+            # Job time already passed — run immediately
+            immediate = now + timedelta(seconds=5)
+            _scheduler.add_job(
+                fn,
+                DateTrigger(run_date=immediate, timezone=config.TZ),
+                id=job_id,
+                name=name,
+                misfire_grace_time=grace,
+                replace_existing=True,
+            )
+            logger.info(
+                "[watchdog] _post_reconnect_catchup: %s missed — running immediately",
+                job_id,
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Connection watchdog
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def connection_watchdog() -> None:
     """
-    Daemon thread — blocks on bridge._disconnect_event and reconnects immediately
-    when IB fires connectionClosed().
+    Daemon thread — blocks on bridge.wait_for_disconnect() and reconnects when
+    IB fires connectionClosed().
 
-    Retry policy: up to 3 attempts at 10-second intervals.
-    On all retries exhausted: critical alert via monitor.send_alert().
-    On success: clears the disconnect event and loops back to waiting.
+    Retry policy:
+      • Clears the disconnect event immediately so any subsequent disconnect
+        during the retry loop is captured.
+      • Sleeps IB_RECONNECT_INTERVAL_SEC between each attempt.
+      • Retries indefinitely until connect() succeeds.
+      • After IB_RECONNECT_ALERT_AFTER failures sends a warning alert once.
+      • On success: if a warning alert was sent, sends a recovery info alert.
+      • Calls _post_reconnect_catchup() to re-register any missed intraday jobs.
+      • Loops back to wait_for_disconnect().
     """
-    _MAX_RETRIES   = 3
-    _RETRY_DELAY_S = 10
-
     logger.info("[watchdog] connection_watchdog started")
 
     while True:
         main.bridge.wait_for_disconnect()
-        logger.warning("[watchdog] disconnect detected — attempting reconnect")
+        main.bridge.clear_disconnect()   # reset now so next disconnect is captured
+        logger.warning("[watchdog] disconnect detected — starting reconnect loop")
 
-        connected = False
-        for attempt in range(1, _MAX_RETRIES + 1):
+        attempt    = 0
+        alert_sent = False
+
+        while True:
+            time.sleep(config.IB_RECONNECT_INTERVAL_SEC)
+            attempt += 1
             try:
                 main.bridge.connect()
-                logger.info("[watchdog] reconnect succeeded (attempt %d)", attempt)
-                connected = True
+                logger.info("[watchdog] reconnect succeeded after %d attempt(s)", attempt)
                 break
             except Exception as exc:
-                logger.warning(
-                    "[watchdog] reconnect attempt %d/%d failed: %s",
-                    attempt, _MAX_RETRIES, exc,
-                )
-                if attempt < _MAX_RETRIES:
-                    time.sleep(_RETRY_DELAY_S)
+                logger.warning("[watchdog] reconnect attempt %d failed: %s", attempt, exc)
+                if attempt == config.IB_RECONNECT_ALERT_AFTER and not alert_sent:
+                    monitor.send_alert(
+                        "IB connection lost",
+                        f"IB connection lost — {attempt} reconnect attempts failed, "
+                        f"retrying every {config.IB_RECONNECT_INTERVAL_SEC}s",
+                        level="warning",
+                    )
+                    alert_sent = True
 
-        if connected:
-            main.bridge.clear_disconnect()
-        else:
-            logger.critical("[watchdog] all %d reconnect attempts failed", _MAX_RETRIES)
+        if alert_sent:
             monitor.send_alert(
-                "IB reconnect FAILED",
-                f"connectionClosed() detected and all {_MAX_RETRIES} reconnect attempts "
-                f"failed. Manual intervention required.",
-                level="critical",
+                "IB connection restored",
+                f"IB connection restored after {attempt} attempt(s)",
+                level="info",
             )
-            # Reset the event so the watchdog can detect the next disconnect
-            main.bridge.clear_disconnect()
+
+        _post_reconnect_catchup()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -341,6 +602,9 @@ def build_scheduler() -> BlockingScheduler:
 if __name__ == "__main__":
     monitor.setup_logging()
 
+    subprocess.Popen(["uv", "--directory", config.API_CONTROLLER_PATH, "run", "main.py"])        
+    time.sleep(2)
+    
     logger.info("[scheduler] Connecting to IB TWS/Gateway")
     try:
         main.bridge.connect()
@@ -349,6 +613,8 @@ if __name__ == "__main__":
         logger.critical("[scheduler] Failed to connect to IB: %s — aborting", exc)
         raise SystemExit(1)
 
+    _startup_halt_warning()
+
     watchdog = threading.Thread(
         target=connection_watchdog,
         daemon=True,
@@ -356,6 +622,10 @@ if __name__ == "__main__":
     )
     watchdog.start()
     logger.info("[scheduler] connection_watchdog thread started")
+
+    sched = build_scheduler()
+
+    startup_catchup()
 
     logger.info("[scheduler] Starting Murphy's Law scheduler")
     logger.info("[scheduler] Timezone: %s", config.TZ)
@@ -370,8 +640,6 @@ if __name__ == "__main__":
     logger.info("  order_submission : close %+d min", config.SCHED_ORDER_OFFSET_MIN)
     logger.info("  fill_reconcil.   : close %+d min", config.SCHED_FILL_OFFSET_MIN)
     logger.info("  daily_report     : close %+d min", config.SCHED_REPORT_OFFSET_MIN)
-
-    sched = build_scheduler()
     try:
         sched.start()
     except (KeyboardInterrupt, SystemExit):

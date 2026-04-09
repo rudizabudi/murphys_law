@@ -14,8 +14,8 @@ import config
 import db
 import td_data
 from td_data import (
-    _BATCH_SIZE,
     _fetch_batch,
+    _inter_batch_delay,
     _parse_rows,
     fetch_bars,
     fetch_full_history,
@@ -285,7 +285,7 @@ class TestBatching:
 
     def test_symbols_split_into_batches(self, monkeypatch):
         """BATCH_SIZE + 1 symbols → two HTTP requests."""
-        symbols = [f"SYM{i:03d}" for i in range(_BATCH_SIZE + 1)]
+        symbols = [f"SYM{i:03d}" for i in range(config.TWELVEDATA_BATCH_SIZE + 1)]
 
         call_count = 0
         def _fake_get(url, params, timeout):
@@ -295,7 +295,7 @@ class TestBatching:
             body = _multi_sym_body(sym_list, n=2)
             return _mock_response(body)
 
-        monkeypatch.setattr(td_data, "_INTER_BATCH_DELAY", 0)
+        monkeypatch.setattr(td_data, "_inter_batch_delay", lambda: 0)
         with patch("httpx.get", side_effect=_fake_get):
             fetch_incremental(symbols, n_days=2)
 
@@ -311,7 +311,7 @@ class TestBatching:
 
     def test_inter_batch_delay_called(self, monkeypatch):
         """time.sleep called between batches (not before first batch)."""
-        symbols = [f"S{i}" for i in range(_BATCH_SIZE + 1)]
+        symbols = [f"S{i}" for i in range(config.TWELVEDATA_BATCH_SIZE + 1)]
         sleep_calls = []
         monkeypatch.setattr(td_data.time, "sleep", lambda s: sleep_calls.append(s))
 
@@ -326,8 +326,8 @@ class TestBatching:
 
     def test_total_rows_across_batches(self, monkeypatch):
         """Total returned = sum of all batches."""
-        symbols = [f"S{i:02d}" for i in range(_BATCH_SIZE + 3)]
-        monkeypatch.setattr(td_data, "_INTER_BATCH_DELAY", 0)
+        symbols = [f"S{i:02d}" for i in range(config.TWELVEDATA_BATCH_SIZE + 3)]
+        monkeypatch.setattr(td_data, "_inter_batch_delay", lambda: 0)
 
         def _fake_get(url, params, timeout):
             sym_list = params["symbol"].split(",")
@@ -483,6 +483,220 @@ class TestRateLimiter:
             # fetch_incremental does NOT go through fetch_bars
             fetch_incremental(["AAPL"], n_days=1)
 
-        # The rate-limiter sleep must not have fired (only _INTER_BATCH_DELAY, which
+        # The rate-limiter sleep must not have fired (only _inter_batch_delay, which
         # is not triggered for a single batch)
         assert self.sleep_calls == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestTopLevelErrorResponse
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTopLevelErrorResponse:
+    """_fetch_batch: top-level API error responses are handled gracefully."""
+
+    def test_top_level_status_error_returns_empty(self):
+        """Response with top-level status='error' → empty dict returned."""
+        body = {"status": "error", "message": "Invalid API key", "code": 401}
+        with patch("httpx.get", return_value=_mock_response(body)):
+            result = _fetch_batch(["AAPL"], outputsize=5)
+        assert result == {}
+
+    def test_top_level_status_error_logs_warning(self, caplog):
+        """Response with top-level status='error' → WARNING logged with message."""
+        body = {"status": "error", "message": "Invalid API key", "code": 401}
+        with patch("httpx.get", return_value=_mock_response(body)):
+            import logging
+            with caplog.at_level(logging.WARNING, logger="murphy"):
+                _fetch_batch(["AAPL"], outputsize=5)
+        assert any("Invalid API key" in r.message for r in caplog.records)
+
+    def test_top_level_code_key_returns_empty(self):
+        """Response containing a top-level 'code' key (even without status='error') → empty dict."""
+        body = {"code": 400, "message": "symbol not found", "status": "error"}
+        with patch("httpx.get", return_value=_mock_response(body)):
+            result = _fetch_batch(["ZZZZ"], outputsize=5)
+        assert result == {}
+
+    def test_top_level_code_without_message_logs_warning(self, caplog):
+        """Response with code but no message → WARNING still logged."""
+        body = {"code": 403, "status": "error"}  # non-429 so rate-limit retry is not triggered
+        with patch("httpx.get", return_value=_mock_response(body)):
+            import logging
+            with caplog.at_level(logging.WARNING, logger="murphy"):
+                _fetch_batch(["AAPL"], outputsize=5)
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestBatchSizeConfig
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBatchSizeConfig:
+    """Batch size reads from config.TWELVEDATA_BATCH_SIZE at call time."""
+
+    @pytest.fixture(autouse=True)
+    def fresh_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "DB_DRIVER", "sqlite")
+        monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "bars.db"))
+        db.init_db()
+
+    def test_batch_size_from_config(self, monkeypatch):
+        """With TWELVEDATA_BATCH_SIZE=3, 4 symbols → 2 HTTP requests."""
+        monkeypatch.setattr(config, "TWELVEDATA_BATCH_SIZE", 3)
+        monkeypatch.setattr(td_data, "_inter_batch_delay", lambda: 0)
+
+        symbols = ["A", "B", "C", "D"]
+        call_count = 0
+
+        def _fake_get(url, params, timeout):
+            nonlocal call_count
+            call_count += 1
+            sym_list = params["symbol"].split(",")
+            return _mock_response(_multi_sym_body(sym_list, n=1))
+
+        with patch("httpx.get", side_effect=_fake_get):
+            fetch_incremental(symbols, n_days=1)
+
+        assert call_count == 2  # ceil(4/3) = 2
+
+    def test_larger_batch_size_fewer_requests(self, monkeypatch):
+        """With TWELVEDATA_BATCH_SIZE=10, 5 symbols → 1 HTTP request."""
+        monkeypatch.setattr(config, "TWELVEDATA_BATCH_SIZE", 10)
+        monkeypatch.setattr(td_data, "_inter_batch_delay", lambda: 0)
+
+        symbols = [f"S{i}" for i in range(5)]
+        body = _multi_sym_body(symbols, n=2)
+        with patch("httpx.get", return_value=_mock_response(body)) as mock_get:
+            fetch_incremental(symbols, n_days=2)
+
+        assert mock_get.call_count == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestInterBatchDelay
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestInterBatchDelay:
+    """_inter_batch_delay() reflects current config values at call time."""
+
+    def test_delay_equals_batch_over_rate_times_60(self, monkeypatch):
+        """delay = (BATCH_SIZE / RATE_LIMIT) * 60."""
+        monkeypatch.setattr(config, "TWELVEDATA_BATCH_SIZE",     8)
+        monkeypatch.setattr(config, "TWELVEDATA_RATE_LIMIT_PER_MIN", 8)
+        assert _inter_batch_delay() == pytest.approx(60.0)
+
+    def test_delay_reflects_changed_batch_size(self, monkeypatch):
+        """Doubling batch size doubles the delay."""
+        monkeypatch.setattr(config, "TWELVEDATA_BATCH_SIZE",     16)
+        monkeypatch.setattr(config, "TWELVEDATA_RATE_LIMIT_PER_MIN", 8)
+        assert _inter_batch_delay() == pytest.approx(120.0)
+
+    def test_delay_reflects_changed_rate_limit(self, monkeypatch):
+        """Doubling rate limit halves the delay."""
+        monkeypatch.setattr(config, "TWELVEDATA_BATCH_SIZE",     8)
+        monkeypatch.setattr(config, "TWELVEDATA_RATE_LIMIT_PER_MIN", 16)
+        assert _inter_batch_delay() == pytest.approx(30.0)
+
+    def test_delay_computed_at_call_time(self, monkeypatch):
+        """Changing config after import is reflected in _inter_batch_delay()."""
+        monkeypatch.setattr(config, "TWELVEDATA_BATCH_SIZE",     4)
+        monkeypatch.setattr(config, "TWELVEDATA_RATE_LIMIT_PER_MIN", 8)
+        first = _inter_batch_delay()
+        monkeypatch.setattr(config, "TWELVEDATA_BATCH_SIZE",     8)
+        second = _inter_batch_delay()
+        assert second == pytest.approx(first * 2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestRateLimitRetry
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRateLimitRetry:
+    """_fetch_batch: rate-limit responses trigger a 60s sleep + one retry."""
+
+    _RATE_LIMIT_BODY_429  = {"code": 429,   "status": "error", "message": "You have run out of API credits"}
+    _RATE_LIMIT_BODY_MSG  = {"code": 400,   "status": "error", "message": "You have run out of API credits for the current minute"}
+    _GOOD_BODY            = None  # set per-test
+
+    @pytest.fixture(autouse=True)
+    def no_real_sleep(self, monkeypatch):
+        self.sleep_args: list[float] = []
+        monkeypatch.setattr(td_data.time, "sleep", lambda s: self.sleep_args.append(s))
+
+    def _good_body(self, symbol="AAPL"):
+        return _single_sym_body(symbol, 3)
+
+    def test_rate_limit_429_triggers_sleep(self):
+        """code=429 response → time.sleep(60) called before retry."""
+        responses = [
+            _mock_response(self._RATE_LIMIT_BODY_429),
+            _mock_response(self._good_body()),
+        ]
+        with patch("httpx.get", side_effect=responses):
+            _fetch_batch(["AAPL"], outputsize=3)
+        assert len(self.sleep_args) == 1
+        assert self.sleep_args[0] == 60
+
+    def test_rate_limit_message_triggers_sleep(self):
+        """'run out of API credits' message → sleep triggered."""
+        responses = [
+            _mock_response(self._RATE_LIMIT_BODY_MSG),
+            _mock_response(self._good_body()),
+        ]
+        with patch("httpx.get", side_effect=responses):
+            _fetch_batch(["AAPL"], outputsize=3)
+        assert len(self.sleep_args) == 1
+
+    def test_successful_retry_returns_data(self):
+        """After rate-limit sleep, successful retry returns the expected data."""
+        responses = [
+            _mock_response(self._RATE_LIMIT_BODY_429),
+            _mock_response(self._good_body()),
+        ]
+        with patch("httpx.get", side_effect=responses):
+            result = _fetch_batch(["AAPL"], outputsize=3)
+        assert "AAPL" in result
+        assert len(result["AAPL"]) == 3
+
+    def test_double_rate_limit_returns_empty(self):
+        """Two consecutive rate-limit responses → empty dict returned."""
+        responses = [
+            _mock_response(self._RATE_LIMIT_BODY_429),
+            _mock_response(self._RATE_LIMIT_BODY_429),
+        ]
+        with patch("httpx.get", side_effect=responses):
+            result = _fetch_batch(["AAPL", "MSFT"], outputsize=3)
+        assert result == {}
+
+    def test_double_rate_limit_logs_warning_with_symbols(self, caplog):
+        """On double failure, WARNING is logged listing the affected symbols."""
+        responses = [
+            _mock_response(self._RATE_LIMIT_BODY_429),
+            _mock_response(self._RATE_LIMIT_BODY_429),
+        ]
+        import logging
+        with patch("httpx.get", side_effect=responses):
+            with caplog.at_level(logging.WARNING, logger="murphy"):
+                _fetch_batch(["AAPL", "MSFT"], outputsize=3)
+        # The retry-failure log must mention the symbols
+        assert any("AAPL" in r.message for r in caplog.records)
+
+    def test_rate_limit_only_retries_once(self):
+        """Only one retry attempt is made — httpx.get called exactly twice."""
+        responses = [
+            _mock_response(self._RATE_LIMIT_BODY_429),
+            _mock_response(self._RATE_LIMIT_BODY_429),
+            _mock_response(self._good_body()),  # third call must never happen
+        ]
+        with patch("httpx.get", side_effect=responses) as mock_get:
+            _fetch_batch(["AAPL"], outputsize=3)
+        assert mock_get.call_count == 2
+
+    def test_non_rate_limit_error_does_not_retry(self):
+        """A generic API error (not rate limit) returns empty without sleeping."""
+        body = {"code": 400, "status": "error", "message": "symbol not found"}
+        with patch("httpx.get", return_value=_mock_response(body)):
+            result = _fetch_batch(["ZZZZ"], outputsize=3)
+        assert result == {}
+        assert self.sleep_args == []

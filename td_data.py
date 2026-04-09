@@ -33,11 +33,19 @@ import db
 
 logger = logging.getLogger("murphy")
 
-_TD_BASE_URL        = "https://api.twelvedata.com/time_series"
-_BATCH_SIZE         = 55     # symbols per HTTP request
-# Each symbol in a batch consumes one API credit; delay ensures the per-minute
-# credit consumption stays within TWELVEDATA_RATE_LIMIT_PER_MIN.
-_INTER_BATCH_DELAY  = (_BATCH_SIZE / config.TWELVEDATA_RATE_LIMIT_PER_MIN) * 60
+_TD_BASE_URL = "https://api.twelvedata.com/time_series"
+
+
+def _inter_batch_delay() -> float:
+    """
+    Compute the inter-batch sleep duration from current config values.
+
+    Each symbol in a batch consumes one API credit; the delay ensures the
+    per-minute credit consumption stays within TWELVEDATA_RATE_LIMIT_PER_MIN.
+    Evaluated at call time so monkeypatching config in tests is reflected
+    immediately.
+    """
+    return (config.TWELVEDATA_BATCH_SIZE / config.TWELVEDATA_RATE_LIMIT_PER_MIN) * 60
 
 # Rate-limiter state for fetch_bars() (single-symbol path)
 _last_request_time: float = 0.0
@@ -47,40 +55,21 @@ _last_request_time: float = 0.0
 # Internal helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_batch(symbols: list[str], outputsize: int) -> dict[str, list[dict]]:
-    """
-    Fetch daily bars for a batch of symbols from the TwelveData /time_series
-    endpoint in a single HTTP request.
+_RATE_LIMIT_RETRY_DELAY = 60  # seconds to wait before retrying a rate-limited batch
 
-    Returns {symbol: [raw_value_dict, ...]} for successfully fetched symbols.
-    Symbols with an error status or missing from the response are omitted.
-    """
-    params = {
-        "symbol":     ",".join(symbols),
-        "interval":   "1day",
-        "outputsize": outputsize,
-        "apikey":     config.TWELVEDATA_API_KEY,
-        "format":     "JSON",
-    }
-    try:
-        resp = httpx.get(_TD_BASE_URL, params=params, timeout=30)
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.warning(
-            "[td_data] HTTP request failed for batch starting %s: %s",
-            symbols[0], exc,
-        )
-        return {}
 
-    data = resp.json()
+def _is_rate_limit_error(data: dict) -> bool:
+    """Return True if the response indicates API credit exhaustion."""
+    return data.get("code") == 429 or "run out of API credits" in str(
+        data.get("message", "")
+    )
 
+
+def _parse_batch_response(symbols: list[str], data: dict) -> dict[str, list[dict]]:
+    """Extract per-symbol value lists from a successful TwelveData response dict."""
     # Single-symbol response has "values" at top level
     if "values" in data:
-        sym = symbols[0]
-        if data.get("status") == "error":
-            logger.warning("[td_data] %s: %s", sym, data.get("message", "unknown error"))
-            return {}
-        return {sym: data["values"]}
+        return {symbols[0]: data["values"]}
 
     # Multi-symbol response: top-level keys are ticker symbols
     result: dict[str, list[dict]] = {}
@@ -94,6 +83,68 @@ def _fetch_batch(symbols: list[str], outputsize: int) -> dict[str, list[dict]]:
         if "values" in sym_data:
             result[sym] = sym_data["values"]
     return result
+
+
+def _fetch_batch(symbols: list[str], outputsize: int) -> dict[str, list[dict]]:
+    """
+    Fetch daily bars for a batch of symbols from the TwelveData /time_series
+    endpoint in a single HTTP request.
+
+    Returns {symbol: [raw_value_dict, ...]} for successfully fetched symbols.
+    Symbols with an error status or missing from the response are omitted.
+
+    Rate-limit handling: if the response indicates API credit exhaustion (code
+    429 or message containing 'run out of API credits'), sleep
+    _RATE_LIMIT_RETRY_DELAY seconds and retry once.  If the retry also fails,
+    log the affected symbols and return {}.
+    """
+    params = {
+        "symbol":     ",".join(symbols),
+        "interval":   "1day",
+        "outputsize": outputsize,
+        "apikey":     config.TWELVEDATA_API_KEY,
+        "format":     "JSON",
+    }
+
+    for attempt in range(2):
+        try:
+            resp = httpx.get(_TD_BASE_URL, params=params, timeout=30)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning(
+                "[td_data] HTTP request failed for batch starting %s: %s",
+                symbols[0], exc,
+            )
+            return {}
+
+        data = resp.json()
+
+        # Rate-limit: sleep and retry once
+        if _is_rate_limit_error(data):
+            if attempt == 0:
+                logger.warning(
+                    "[td_data] rate limit hit, waiting 60s before retry"
+                )
+                time.sleep(_RATE_LIMIT_RETRY_DELAY)
+                continue
+            else:
+                logger.warning(
+                    "[td_data] rate limit retry failed for symbols: %s",
+                    symbols,
+                )
+                return {}
+
+        # Other top-level API error
+        if data.get("status") == "error" or "code" in data:
+            logger.warning(
+                "[td_data] API error for batch starting %s: %s",
+                symbols[0], data.get("message", data),
+            )
+            return {}
+
+        return _parse_batch_response(symbols, data)
+
+    return {}  # unreachable, but satisfies type checker
 
 
 def _parse_rows(symbol: str, values: list[dict]) -> list[dict]:
@@ -127,15 +178,16 @@ def _fetch_and_upsert(symbols: list[str], outputsize: int) -> int:
         return 0
 
     total = 0
+    batch_size = config.TWELVEDATA_BATCH_SIZE
     batches = [
-        symbols[i: i + _BATCH_SIZE]
-        for i in range(0, len(symbols), _BATCH_SIZE)
+        symbols[i: i + batch_size]
+        for i in range(0, len(symbols), batch_size)
     ]
     n_batches = len(batches)
 
     for idx, batch in enumerate(batches):
         if idx > 0:
-            time.sleep(_INTER_BATCH_DELAY)
+            time.sleep(_inter_batch_delay())
 
         fetched = _fetch_batch(batch, outputsize)
         if not fetched:

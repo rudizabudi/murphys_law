@@ -11,6 +11,9 @@ from zoneinfo import ZoneInfo
 TZ    = ZoneInfo("America/New_York")
 _BASE = Path(__file__).resolve().parent
 
+STRATEGY ="MurphysLaw"
+VERSION = "0.0.1"
+
 # ── Backtest-parity parameters (do not change without re-backtesting) ──────────
 ENTRY_N_DAY_RETURN        = 3
 RETURN_RANK_RANGE         = 252
@@ -50,17 +53,24 @@ IB_PORT                   = 7498        # 7497 for paper trading
 IB_CLIENT_ID              = 1001
 IB_SUBACCOUNT             = ""          # Subaccount ID (e.g. "DU1234567"); empty = use master account
 IB_HEARTBEAT_TIMEOUT_SEC  = 5           # seconds to wait for reqCurrentTime response
-IB_SOFT_ERROR_CODES       = [300, 2104, 2106, 2107, 2108, 2158, 10268]   # informational; not logged as errors
+IB_RECONNECT_INTERVAL_SEC = 30          # seconds between reconnect attempts in connection_watchdog
+IB_RECONNECT_ALERT_AFTER  = 10         # send warning alert after this many failed reconnect attempts
+IB_SOFT_ERROR_CODES       = [300, 1100, 2103, 2104, 2105, 2106, 2107, 2108, 2157, 2158, 10268]   # informational; not logged as errors
 IB_REJECTION_CODES        = [201, 202, 203, 321, 322]         # hard order rejections
 
 # ── IBC (automated TWS/Gateway login) ──────────────────────────────────────────
-IBC_MODE              = "gateway"          # "gateway" | "tws"
-IBC_DIR               = "/home/rudizabudi/Jts/IBC/"         # IBC installation directory
-IBC_GATEWAY_START     = "/home/rudizabudi/Jts/IBC/gatewaystart.sh"
-IBC_TWS_START         = "/home/rudizabudi/Jts/IBC/twsstart.sh"
-IBC_COMMAND_SEND      = "/home/rudizabudi/Jts/IBC/commandsend.sh"
-IBC_TWS_PATH          = "/home/rudizabudi/Jts/Trader Workstation.desktop"
-IBC_CONFIG_PATH       = "/home/rudizabudi/Jts/IBC/config.ini"
+IBC_MODE              = "gateway"# "gateway" | "tws"
+IBC_CONTROLLER_HOST   = "127.0.0.1"
+IBC_CONTROLLER_PORT   = 8123
+
+API_CONTROLLER_PATH = "/home/rudizabudi/OneDrive/CloudDesktop/Python/tws_api_controller/"
+
+#IBC_DIR               = "/home/rudizabudi/Jts/IBC/"         # IBC installation directory
+#IBC_GATEWAY_START     = "/home/rudizabudi/Jts/IBC/gatewaystart.sh"
+#IBC_TWS_START         = "/home/rudizabudi/Jts/IBC/twsstart.sh"
+#IBC_COMMAND_SEND      = "/home/rudizabudi/Jts/IBC/commandsend.sh"
+#IBC_TWS_PATH          = "/home/rudizabudi/Jts/Trader Workstation.desktop"
+#IBC_CONFIG_PATH       = "/home/rudizabudi/Jts/IBC/config.ini"
 IBC_2FA_DAY           = "sunday"
 IBC_2FA_TIME          = "18:00"
 IBC_RESTART_TIMEOUT   = 120               # seconds to wait for TWS/Gateway restart
@@ -73,6 +83,7 @@ SCHED_SIGNAL_OFFSET_MIN     = -20       # Signal snap: close - 20 min
 SCHED_ORDER_OFFSET_MIN      = -16       # Order submission: close - 16 min
 SCHED_FILL_OFFSET_MIN       = +10       # Fill reconciliation: close + 10 min
 SCHED_REPORT_OFFSET_MIN     = +15       # Daily report: close + 15 min
+SCHED_MIN_LEAD_MINS         = 5         # Minimum lead time (minutes) before a job is worth scheduling
 
 # ── Half-day calendar fallback ──────────────────────────────────────────────────
 HALF_DAY_DATES: list[str] = [
@@ -87,9 +98,10 @@ ENTRY_LOC_BUFFER_PCT      = 0.003       # 0.3% above snap price; ignored if MOC
 EXIT_ORDER_TYPE           = "MOC"       # keep exits as MOC — non-execution risk too high
 
 # ── Data sources ────────────────────────────────────────────────────────────────
-TWELVEDATA_API_KEY            = "537ffc80a90f4bbe91b80414a9aec78f"
+TWELVEDATA_API_KEY            = "20bb864efdd54e0caba2414a96116cd5" #"537ffc80a90f4bbe91b80414a9aec78f"
 TWELVEDATA_INCREMENTAL_DAYS   = 5           # normal nightly lookback
 TWELVEDATA_HISTORY_DAYS       = 550         # full history depth for new symbols (~252 bars + buffer)
+TWELVEDATA_BATCH_SIZE         = 8           # symbols per HTTP request; free tier = 8, paid plans support higher values
 TWELVEDATA_RATE_LIMIT_PER_MIN = 8           # Free tier: 8 credits/min. Paid plans support higher limits. Each symbol in a batch = 1 credit.
 UNIVERSE_CSV                  = str(_BASE / "state" / "universe.csv")
 
@@ -157,7 +169,8 @@ RISK_FILL_TIMEOUT_MINS          = 30
 RISK_FILL_TIMEOUT_ACTION        = ["notify"]
 
 RISK_RECONCILE_ENABLED          = True
-RISK_RECONCILE_ACTION           = ["halt", "notify"]
+RISK_RECONCILE_HALT             = False      # Set True to halt trading on mismatch; False for notify-only (safe default for multi-strategy / paper accounts)
+RISK_RECONCILE_ACTION           = ["notify"] # Change to ["halt", "notify"] when RISK_RECONCILE_HALT=True
 
 RISK_IMBALANCE_ENABLED          = False     # optional; disabled by default
 RISK_IMBALANCE_THRESHOLD        = 0.3
