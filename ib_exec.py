@@ -284,7 +284,25 @@ class IBBridge(EWrapper, EClient):
         """
         Open connection to TWS/Gateway and start the EClient message loop in a
         daemon thread. Blocks until nextValidId fires (confirms the API is live).
+
+        On reconnect: tears down any live thread first, drains all queues so
+        stale responses from the previous session don't bleed in, and clears
+        _disconnect_event so connection_watchdog won't fire spuriously.
         """
+        # Always start with a clean disconnect event so watchdog won't trip.
+        self._disconnect_event.clear()
+
+        # If a previous run-thread is still alive, force-close the socket and
+        # wait up to 5 seconds for the thread to exit cleanly.
+        if self._thread is not None and self._thread.is_alive():
+            EClient.disconnect(self)
+            self._thread.join(timeout=5)
+
+        # Discard any stale responses queued from the previous session.
+        for q in (self._order_id_q, self._account_q, self._exec_q,
+                  self._position_q, self._time_q):
+            self._drain(q)
+
         EClient.connect(self, config.IB_HOST, config.IB_PORT, config.IB_CLIENT_ID)
         self._thread = threading.Thread(target=self.run, daemon=True, name="ib-run")
         self._thread.start()

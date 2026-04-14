@@ -803,6 +803,13 @@ class IBBridge:
 
 **Disconnect event mechanism:** `IBBridge._disconnect_event` is a `threading.Event` initialised in `__init__`. The `connectionClosed()` EWrapper callback (fired by ibapi when the TCP connection is lost) calls `_disconnect_event.set()`. `wait_for_disconnect()` blocks on this event; `clear_disconnect()` resets it.
 
+**`connect()` cleanup on reconnect:** Before opening a new socket, `connect()` always:
+1. Calls `_disconnect_event.clear()` so the watchdog cannot trip on a stale event from the previous session.
+2. Checks `self._thread.is_alive()`. If the old run-thread is still live, calls `EClient.disconnect(self)` to close the socket, then `self._thread.join(timeout=5)` to wait for it to exit.
+3. Drains `_order_id_q`, `_account_q`, `_exec_q`, `_position_q`, and `_time_q` via `_drain()` so no stale callback data from the previous session is consumed by new requests.
+
+These steps run unconditionally on every call to `connect()`, including the initial startup call.
+
 **`connection_watchdog()` daemon thread** (in `scheduler.py`):
 1. Blocks on `wait_for_disconnect()` — returns when `connectionClosed()` fires.
 2. Calls `clear_disconnect()` immediately so any subsequent disconnect during the retry loop can be detected on the next outer iteration.

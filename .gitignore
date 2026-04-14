@@ -13,6 +13,6 @@ logs/
 # Virtual environments
 .venv
 
-config.py
 ib_exec.py
 tester.py
+config.py

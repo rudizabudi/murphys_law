@@ -257,6 +257,66 @@ class TestIBBridgeConnect:
         assert len(slept) == 1
         assert slept[0] == 3
 
+    def test_connect_cleans_up_alive_thread_before_reconnecting(self):
+        """If a previous thread is alive connect() must disconnect and join it."""
+        bridge = IBBridge()
+        bridge._disconnect_event = threading.Event()
+
+        # Simulate a thread that is 'alive' at check time but finishes immediately.
+        old_thread = MagicMock(spec=threading.Thread)
+        old_thread.is_alive.return_value = True
+        bridge._thread = old_thread
+
+        def fake_run():
+            bridge.nextValidId(99)
+
+        with patch("ibapi.client.EClient.connect"):
+            with patch("ibapi.client.EClient.run", side_effect=fake_run):
+                with patch("ibapi.client.EClient.disconnect") as mock_disc:
+                    bridge.connect()
+
+        mock_disc.assert_called_once()
+        old_thread.join.assert_called_once_with(timeout=5)
+
+    def test_connect_drains_all_queues_before_reconnecting(self):
+        """Stale items in all queues must be discarded before a new connect."""
+        bridge = IBBridge()
+        bridge._disconnect_event = threading.Event()
+
+        # Pre-load stale items into every queue.
+        for q in (bridge._order_id_q, bridge._account_q, bridge._exec_q,
+                  bridge._position_q, bridge._time_q):
+            q.put("stale")
+
+        def fake_run():
+            bridge.nextValidId(7)
+
+        with patch("ibapi.client.EClient.connect"):
+            with patch("ibapi.client.EClient.run", side_effect=fake_run):
+                bridge.connect()
+
+        # _order_id_q was refilled by nextValidId(7) then consumed by connect();
+        # all others must be empty.
+        assert bridge._account_q.empty()
+        assert bridge._exec_q.empty()
+        assert bridge._position_q.empty()
+        assert bridge._time_q.empty()
+
+    def test_connect_clears_disconnect_event(self):
+        """_disconnect_event must be cleared at the start of connect()."""
+        bridge = IBBridge()
+        bridge._disconnect_event = threading.Event()
+        bridge._disconnect_event.set()  # pre-set, as if a prior disconnect fired
+
+        def fake_run():
+            bridge.nextValidId(1)
+
+        with patch("ibapi.client.EClient.connect"):
+            with patch("ibapi.client.EClient.run", side_effect=fake_run):
+                bridge.connect()
+
+        assert not bridge._disconnect_event.is_set()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TestSubmitOrder

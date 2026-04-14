@@ -755,9 +755,23 @@ def fill_reconciliation() -> None:
                         sym, sub.get("reason"), fill_qty, fill_price, net_pnl)
 
     # ── Equity snapshot ───────────────────────────────────────────────────────
+    # Reload positions to capture all saves/closes performed above.
     positions_now = portfolio_state.load_positions()
-    open_equity   = portfolio_state.get_open_equity(positions_now, snap_prices)
-    deployed_pct  = open_equity / current_equity if current_equity > 0 else 0.0
+
+    # Build prices for get_open_equity: start from snap_prices (pre-fill), then
+    # overlay actual fill prices for newly entered positions so that deployed_pct
+    # reflects real capital deployed rather than stale snapshot prices.
+    effective_prices = dict(snap_prices)
+    for oid, fill in filled.items():
+        sub = _submitted.get(oid, {})
+        if sub.get("action") == "BUY":
+            sym = sub["symbol"]
+            fill_price = float(fill.get("fill_price", sub.get("fill_price", 0)))
+            if fill_price > 0:
+                effective_prices[sym] = fill_price
+
+    open_equity  = portfolio_state.get_open_equity(positions_now, effective_prices)
+    deployed_pct = open_equity / current_equity if current_equity > 0 else 0.0
 
     # BOD equity from yesterday's eod (if available)
     bod = current_equity
