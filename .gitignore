@@ -16,3 +16,4 @@ logs/
 ib_exec.py
 tester.py
 config.py
+console_output.txt

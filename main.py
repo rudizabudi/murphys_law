@@ -182,15 +182,22 @@ def _consec_loss_stats() -> tuple[int, int]:
 def _reconcile_with_ib(
     positions: list[dict],
     ib_positions: list[dict],
+    exclude_symbols: set[str] | None = None,
 ) -> tuple[bool, str]:
     """
     Compare DB open position symbols against the full IB position report.
     Using the live IB position list catches pre-existing discrepancies from
     prior sessions, not just today's fills.
+
+    exclude_symbols: symbols to exclude from both sides (e.g. same-day exits
+    that were just closed — IB confirms the sell but the position is already
+    gone from DB, so comparing them would always look like a mismatch).
+
     Returns (mismatch: bool, detail: str).
     """
-    ib_syms  = {p["symbol"] for p in ib_positions}
-    db_syms  = {p["symbol"] for p in positions}
+    exclude  = exclude_symbols or set()
+    ib_syms  = {p["symbol"] for p in ib_positions} - exclude
+    db_syms  = {p["symbol"] for p in positions}    - exclude
     extra_ib = ib_syms - db_syms
     extra_db = db_syms - ib_syms
     if extra_ib or extra_db:
@@ -677,6 +684,8 @@ def fill_reconciliation() -> None:
         logger.warning("[main] fill_reconciliation: split detection failed: %s", exc)
 
     # ── Process fills ─────────────────────────────────────────────────────────
+    exited_today: set[str] = set()   # symbols closed in this reconciliation run
+
     for oid, fill in filled.items():
         sub = _submitted.get(oid, {})
         if not sub:
@@ -730,6 +739,7 @@ def fill_reconciliation() -> None:
                         sym, fill_qty, fill_price)
 
         elif action == "SELL":
+            exited_today.add(sym)
             pos_id = sub.get("pos_id", "")
             if not pos_id:
                 # Try to find by symbol in open positions
@@ -753,6 +763,16 @@ def fill_reconciliation() -> None:
             })
             logger.info("[main] fill_reconciliation: closed %s (%s) qty=%d @ %.4f pnl=%.2f",
                         sym, sub.get("reason"), fill_qty, fill_price, net_pnl)
+
+    # ── Persist updated bars_held / consec_lows for still-open positions ─────
+    # get_exit_signals() in signal_snap() mutates bars_held/consec_lows in-place
+    # on the snap-state open positions but never writes those values back to DB.
+    # Save every position that was NOT exited this run so the counters survive
+    # across reconciliation cycles.
+    snap_open = _snap_state.get("open_positions", [])
+    for sp in snap_open:
+        if sp.get("symbol") not in exited_today:
+            portfolio_state.save_position(sp)
 
     # ── Equity snapshot ───────────────────────────────────────────────────────
     # Reload positions to capture all saves/closes performed above.
@@ -789,9 +809,11 @@ def fill_reconciliation() -> None:
         today, bod, current_equity, len(positions_now), deployed_pct,
     )
 
-    # ── IB reconciliation (exclude already-handled splits) ───────────────────
+    # ── IB reconciliation (exclude splits and same-day exits) ────────────────
     non_split_positions = [p for p in positions_now if p["symbol"] not in split_symbols]
-    mismatch, detail = _reconcile_with_ib(non_split_positions, ib_pos)
+    mismatch, detail = _reconcile_with_ib(
+        non_split_positions, ib_pos, exclude_symbols=exited_today
+    )
     if mismatch:
         if config.RISK_RECONCILE_HALT:
             alert_body = (
@@ -879,35 +901,111 @@ def daily_report() -> None:
     account        = _snap_state.get("account", {})
     current_equity = float(account.get("net_liquidation", equity_eod))
     snap_prices    = _snap_state.get("snap_prices", {})
+    accrued_interest = float(account.get("accrued_interest", 0.0))
     deployed_pct   = 0.0
     if current_equity > 0:
         deployed_pct = portfolio_state.get_open_equity(open_positions, snap_prices) / current_equity
 
-    # YTD P&L from equity_log
-    ytd_pnl = 0.0
-    ytd_pct  = 0.0
+    # Enrich open positions with current price and unrealised P&L
+    open_positions_enriched: list[dict] = []
+    for pos in open_positions:
+        sym        = pos.get("symbol", "")
+        fill_price = float(pos.get("fill_price", 0) or 0)
+        shares     = int(pos.get("shares", 0) or 0)
+        notional   = fill_price * shares
+        cur_price  = float(snap_prices.get(sym) or fill_price)
+        unreal_pnl = (cur_price - fill_price) * shares
+        unreal_pct = (cur_price / fill_price - 1) * 100.0 if fill_price > 0 else 0.0
+        entry_date = pos.get("entry_date")
+        try:
+            days_held = (today - date.fromisoformat(str(entry_date))).days if entry_date else 0
+        except (ValueError, TypeError):
+            days_held = 0
+        open_positions_enriched.append({
+            "symbol":             sym,
+            "entry_date":         entry_date,
+            "days_held":          days_held,
+            "shares":             shares,
+            "fill_price":         fill_price,
+            "notional":           notional,
+            "current_price":      cur_price,
+            "unrealised_pnl":     unreal_pnl,
+            "unrealised_pnl_pct": unreal_pct,
+        })
+
+    # YTD P&L, APY windows, ATH, and drawdown from equity_log
+    ytd_pnl      = 0.0
+    ytd_pct      = 0.0
+    apy_inception = None
+    apy_7d       = None
+    apy_30d      = None
+    apy_90d      = None
+    ath          = equity_eod
+    drawdown_pct = None
+
     try:
         with db.connect() as conn:
-            first = conn.execute(
-                "SELECT equity_eod FROM equity_log ORDER BY date ASC LIMIT 1"
-            ).fetchone()
-        if first and first[0]:
-            start_eq = float(first[0])
-            ytd_pnl  = equity_eod - start_eq
-            ytd_pct  = ytd_pnl / start_eq if start_eq > 0 else 0.0
-    except Exception:
-        pass
+            eq_rows = conn.execute(
+                "SELECT date, equity_eod FROM equity_log ORDER BY date ASC"
+            ).fetchall()
+        if eq_rows:
+            eq_dates = [r[0] for r in eq_rows]
+            eq_vals  = [float(r[1]) for r in eq_rows]
+            n_eq     = len(eq_rows)
+            ath      = max(eq_vals)
+
+            # YTD P&L (first ever equity snapshot → today)
+            ytd_start = eq_vals[0]
+            if ytd_start > 0:
+                ytd_pnl = equity_eod - ytd_start
+                ytd_pct = ytd_pnl / ytd_start
+
+            def _apy(start_eq: float, start_date_str) -> float | None:
+                try:
+                    d1 = date.fromisoformat(str(start_date_str))
+                except (ValueError, TypeError):
+                    return None
+                days = max(1, (today - d1).days)
+                if start_eq <= 0 or equity_eod <= 0:
+                    return None
+                return ((equity_eod / start_eq) ** (365.0 / days) - 1) * 100.0
+
+            # Inception APY (requires ≥30 trading days of history)
+            if n_eq >= 30:
+                apy_inception = _apy(eq_vals[0], eq_dates[0])
+
+            # Window APYs: look back N rows from the end
+            if n_eq >= 7:
+                apy_7d  = _apy(eq_vals[-7],  eq_dates[-7])
+            if n_eq >= 30:
+                apy_30d = _apy(eq_vals[-30], eq_dates[-30])
+            if n_eq >= 90:
+                apy_90d = _apy(eq_vals[-90], eq_dates[-90])
+
+            # Drawdown from ATH
+            if ath > 0 and equity_eod < ath:
+                drawdown_pct = (equity_eod / ath - 1) * 100.0
+    except Exception as exc:
+        logger.warning("[main] daily_report: equity_log APY/ATH query failed: %s", exc)
 
     report_data = {
-        "date":         today,
-        "equity_bod":   equity_bod,
-        "equity_eod":   equity_eod,
-        "exits":        exits_today,
-        "entries":      entries_today,
-        "n_open":       len(open_positions),
-        "deployed_pct": deployed_pct,
-        "ytd_pnl":      ytd_pnl,
-        "ytd_pnl_pct":  ytd_pct,
+        "date":                  today,
+        "equity_bod":            equity_bod,
+        "equity_eod":            equity_eod,
+        "exits":                 exits_today,
+        "entries":               entries_today,
+        "n_open":                len(open_positions),
+        "deployed_pct":          deployed_pct,
+        "ytd_pnl":               ytd_pnl,
+        "ytd_pnl_pct":           ytd_pct,
+        "open_positions_enriched": open_positions_enriched,
+        "apy_inception":         apy_inception,
+        "apy_7d":                apy_7d,
+        "apy_30d":               apy_30d,
+        "apy_90d":               apy_90d,
+        "ath":                   ath,
+        "drawdown_pct":          drawdown_pct,
+        "accrued_interest":      accrued_interest,
     }
 
     if config.REPORT_DAILY:
@@ -916,7 +1014,82 @@ def daily_report() -> None:
         logger.info("[main] daily_report: sent daily report")
 
     if config.REPORT_WEEKLY and today.strftime("%A").lower() == config.REPORT_WEEKLY_DAY.lower():
-        monitor.send_report(monitor.build_daily_report(report_data), is_weekly=True)
+        from datetime import timedelta
+        monday = today - timedelta(days=today.weekday())
+
+        equity_week_start = 0.0
+        equity_week_end   = 0.0
+        try:
+            with db.connect() as conn:
+                row = conn.execute(
+                    "SELECT equity_eod FROM equity_log WHERE date >= ? ORDER BY date ASC LIMIT 1",
+                    (str(monday),),
+                ).fetchone()
+                if row and row[0]:
+                    equity_week_start = float(row[0])
+                row = conn.execute(
+                    "SELECT equity_eod FROM equity_log WHERE date = ?",
+                    (str(today),),
+                ).fetchone()
+                if row and row[0]:
+                    equity_week_end = float(row[0])
+        except Exception as exc:
+            logger.warning("[main] daily_report: weekly equity query failed: %s", exc)
+
+        exits_week:   list[dict] = []
+        entries_week: list[dict] = []
+        try:
+            with db.connect() as conn:
+                exits_week = [
+                    dict(r) for r in conn.execute(
+                        "SELECT symbol, exit_reason, pnl, bars_held FROM trade_log "
+                        "WHERE exit_date >= ? AND exit_date <= ?",
+                        (str(monday), str(today)),
+                    ).fetchall()
+                ]
+                entries_week = [
+                    {
+                        "symbol":      r["symbol"],
+                        "fill_price":  r["fill_price"],
+                        "shares":      r["shares"],
+                        "order_type":  r["order_type"] if r["order_type"] is not None
+                                       else config.ENTRY_ORDER_TYPE,
+                        "limit_price": r["limit_price"],
+                        "qpi":         r["qpi_at_entry"]  if r["qpi_at_entry"]  is not None else 0.0,
+                        "ibs":         r["ibs_at_entry"]  if r["ibs_at_entry"]  is not None else 0.0,
+                    }
+                    for r in conn.execute(
+                        "SELECT symbol, fill_price, shares, order_type, limit_price, "
+                        "qpi_at_entry, ibs_at_entry FROM positions "
+                        "WHERE entry_date >= ? AND entry_date <= ?",
+                        (str(monday), str(today)),
+                    ).fetchall()
+                ]
+        except Exception as exc:
+            logger.warning("[main] daily_report: weekly trade query failed: %s", exc)
+
+        week_data = {
+            "week_start":   monday,
+            "week_end":     today,
+            "equity_start": equity_week_start,
+            "equity_end":   equity_week_end,
+            "exits":        exits_week,
+            "entries":      entries_week,
+            "n_open":       len(open_positions),
+            "deployed_pct": deployed_pct,
+            "ytd_pnl":      ytd_pnl,
+            "ytd_pnl_pct":  ytd_pct,
+            "open_positions_enriched": open_positions_enriched,
+            "apy_inception":         apy_inception,
+            "apy_7d":                apy_7d,
+            "apy_30d":               apy_30d,
+            "apy_90d":               apy_90d,
+            "ath":                   ath,
+            "drawdown_pct":          drawdown_pct,
+            "accrued_interest":      accrued_interest,
+        }
+        weekly_text = monitor.build_weekly_report(week_data)
+        monitor.send_report(weekly_text, is_weekly=True)
         logger.info("[main] daily_report: sent weekly report")
 
 

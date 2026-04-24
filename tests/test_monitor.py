@@ -25,8 +25,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 import monitor
 from monitor import (
+    _pct,
     _split_lines,
+    _usd,
     build_daily_report,
+    build_weekly_report,
     send_alert,
     send_report,
 )
@@ -407,7 +410,7 @@ class TestBuildDailyReport:
                  "limit_price": 28.11, "qpi": 0.06, "ibs": 0.11},
             ],
             "n_open":        13,
-            "deployed_pct":  132.4,
+            "deployed_pct":  1.324,
             "ytd_pnl":       92_500.0,
             "ytd_pnl_pct":   12.3,
         }
@@ -471,6 +474,22 @@ class TestBuildDailyReport:
         report = build_daily_report(sample_data)
         assert "132.4%" in report
 
+    def test_deployed_pct_fraction_renders_as_percentage(self):
+        """deployed_pct=1.193 (fraction) must render as 119.3% of NLV, not 1.2%."""
+        report = build_daily_report({
+            "date":         date(2026, 4, 14),
+            "equity_bod":   1_000_000.0,
+            "equity_eod":   1_010_000.0,
+            "exits":        [],
+            "entries":      [],
+            "n_open":       10,
+            "deployed_pct": 1.193,
+            "ytd_pnl":      10_000.0,
+            "ytd_pnl_pct":  1.0,
+        })
+        assert "119.3% of NLV" in report
+        assert "1.2%" not in report
+
     def test_ytd_pnl_shown(self, sample_data):
         report = build_daily_report(sample_data)
         assert "92,500" in report
@@ -503,7 +522,7 @@ class TestBuildDailyReport:
             "exits":        [],
             "entries":      [],
             "n_open":       2,
-            "deployed_pct": 30.0,
+            "deployed_pct": 0.30,
             "ytd_pnl":      -5_000.0,
             "ytd_pnl_pct":  -5.0,
         })
@@ -521,9 +540,452 @@ class TestBuildDailyReport:
                  "limit_price": None, "qpi": 0.05, "ibs": 0.12},
             ],
             "n_open":       1,
-            "deployed_pct": 5.0,
+            "deployed_pct": 0.05,
             "ytd_pnl":      0.0,
             "ytd_pnl_pct":  0.0,
         })
         assert "MOC" in report
         assert "@ limit" not in report
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestPctFormatting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPctFormatting:
+    """Verify updated _pct() behaviour: -0.0 guard, tiny-value 2dp override."""
+
+    def test_zero_returns_zero_string(self):
+        assert _pct(0.0) == "0.0%"
+
+    def test_negative_zero_returns_zero_string(self):
+        # -0.0 == 0.0 in Python; must not render as '-0.0%'
+        assert _pct(-0.0) == "0.0%"
+
+    def test_positive_value_has_plus_sign(self):
+        assert _pct(1.5).startswith("+")
+
+    def test_negative_value_has_minus_sign(self):
+        assert _pct(-1.5).startswith("-")
+
+    def test_value_below_threshold_uses_two_decimals(self):
+        # abs(0.03) < 0.05 → must show 2 dp
+        result = _pct(0.03)
+        assert result == "+0.03%"
+
+    def test_value_exactly_at_threshold_uses_passed_decimals(self):
+        # abs(0.05) is NOT < 0.05 → use default 1 dp
+        result = _pct(0.05)
+        assert result == "+0.1%"
+
+    def test_value_above_threshold_uses_passed_decimals(self):
+        result = _pct(12.3, 1)
+        assert result == "+12.3%"
+
+    def test_large_value_explicit_two_decimals(self):
+        result = _pct(0.74, 2)
+        assert result == "+0.74%"
+
+    def test_negative_tiny_value_uses_two_decimals(self):
+        result = _pct(-0.03)
+        assert result == "-0.03%"
+
+    def test_default_decimals_is_one(self):
+        # No decimals arg → default 1 (unless tiny override kicks in)
+        result = _pct(5.5)
+        assert result == "+5.5%"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestBuildWeeklyReport
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBuildWeeklyReport:
+
+    @pytest.fixture
+    def week_data(self):
+        return {
+            "week_start":   date(2026, 4,  6),
+            "week_end":     date(2026, 4, 10),
+            "equity_start": 840_000.0,
+            "equity_end":   855_000.0,
+            "exits": [
+                {"symbol": "NVDA", "exit_reason": "ibs_exit",  "pnl": 1842.0,  "bars_held": 3},
+                {"symbol": "AAPL", "exit_reason": "time_stop", "pnl": -2105.0, "bars_held": 15},
+            ],
+            "entries": [
+                {"symbol": "PLTR", "order_type": "LOC", "shares": 142,
+                 "limit_price": 45.23, "qpi": 0.08, "ibs": 0.14},
+            ],
+            "n_open":       12,
+            "deployed_pct": 1.185,
+            "ytd_pnl":      15_000.0,
+            "ytd_pnl_pct":  1.8,
+        }
+
+    def test_contains_week_start_and_end(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "2026-04-06" in report
+        assert "2026-04-10" in report
+
+    def test_contains_equity_start(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "840,000" in report
+
+    def test_contains_equity_end(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "855,000" in report
+
+    def test_equity_change_positive(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "+$15,000" in report
+
+    def test_exit_symbols_present(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "NVDA" in report
+        assert "AAPL" in report
+
+    def test_exit_reasons_present(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "ibs_exit"  in report
+        assert "time_stop" in report
+
+    def test_negative_exit_pnl_formatted(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "-$2,105" in report
+
+    def test_entry_symbol_present(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "PLTR" in report
+
+    def test_entry_limit_price_shown(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "45.23" in report
+
+    def test_entry_qpi_ibs_shown(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "QPI=0.08" in report
+        assert "IBS=0.14" in report
+
+    def test_open_positions_shown(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "12" in report
+        assert str(config.MAX_POSITIONS) in report
+
+    def test_deployed_pct_shown(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "118.5%" in report
+
+    def test_ytd_pnl_shown(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "15,000" in report
+        assert "1.8%" in report
+
+    def test_rule_lines_present(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "─" * 10 in report
+
+    def test_weekly_header_in_report(self, week_data):
+        report = build_weekly_report(week_data)
+        assert "Weekly Report" in report
+
+    def test_zero_exits_zero_entries(self):
+        report = build_weekly_report({
+            "week_start":   date(2026, 1, 5),
+            "week_end":     date(2026, 1, 9),
+            "equity_start": 100_000.0,
+            "equity_end":   100_000.0,
+            "exits":        [],
+            "entries":      [],
+            "n_open":       0,
+            "deployed_pct": 0.0,
+            "ytd_pnl":      0.0,
+            "ytd_pnl_pct":  0.0,
+        })
+        assert "Exits this week:    0" in report
+        assert "Entries this week:  0" in report
+
+    def test_moc_entry_shows_moc(self):
+        report = build_weekly_report({
+            "week_start":   date(2026, 2, 2),
+            "week_end":     date(2026, 2, 6),
+            "equity_start": 100_000.0,
+            "equity_end":   100_000.0,
+            "exits":        [],
+            "entries": [
+                {"symbol": "TSLA", "order_type": "MOC", "shares": 50,
+                 "limit_price": None, "qpi": 0.05, "ibs": 0.12},
+            ],
+            "n_open":       1,
+            "deployed_pct": 0.05,
+            "ytd_pnl":      0.0,
+            "ytd_pnl_pct":  0.0,
+        })
+        assert "MOC" in report
+        assert "@ limit" not in report
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestReportEnhancements — positions table, APY, drawdown, accrued interest
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestReportEnhancements:
+    """Covers the enriched fields added to both daily and weekly reports."""
+
+    @pytest.fixture
+    def base_data(self):
+        return {
+            "date":         date(2026, 4, 14),
+            "equity_bod":   1_000_000.0,
+            "equity_eod":   1_010_000.0,
+            "exits":        [],
+            "entries":      [],
+            "n_open":       2,
+            "deployed_pct": 0.80,
+            "ytd_pnl":      10_000.0,
+            "ytd_pnl_pct":  1.0,
+        }
+
+    @pytest.fixture
+    def two_positions(self):
+        return [
+            {
+                "symbol":             "XOM",
+                "entry_date":         "2026-04-09",
+                "days_held":          5,
+                "shares":             100,
+                "fill_price":         155.17,
+                "notional":           15_517.0,
+                "current_price":      161.20,
+                "unrealised_pnl":     603.0,
+                "unrealised_pnl_pct": 3.88,
+            },
+            {
+                "symbol":             "CVX",
+                "entry_date":         "2026-04-07",
+                "days_held":          7,
+                "shares":             50,
+                "fill_price":         200.00,
+                "notional":           10_000.0,
+                "current_price":      195.00,
+                "unrealised_pnl":     -250.0,
+                "unrealised_pnl_pct": -2.5,
+            },
+        ]
+
+    # ── Positions table ───────────────────────────────────────────────────────
+
+    def test_positions_table_symbols_shown(self, base_data, two_positions):
+        base_data["open_positions_enriched"] = two_positions
+        report = build_daily_report(base_data)
+        assert "XOM" in report
+        assert "CVX" in report
+
+    def test_positions_table_omitted_when_no_enriched_key(self, base_data):
+        report = build_daily_report(base_data)
+        assert "Total unrealised" not in report
+
+    def test_positions_table_omitted_when_empty_list(self, base_data):
+        base_data["open_positions_enriched"] = []
+        report = build_daily_report(base_data)
+        assert "Total unrealised" not in report
+
+    def test_total_unrealised_pnl_shown(self, base_data, two_positions):
+        base_data["open_positions_enriched"] = two_positions
+        report = build_daily_report(base_data)
+        # 603 + (-250) = 353
+        assert "Total unrealised" in report
+        assert "+$353" in report
+
+    def test_negative_unrealised_formatted_correctly(self, base_data):
+        base_data["open_positions_enriched"] = [
+            {
+                "symbol":             "AAPL",
+                "entry_date":         "2026-04-01",
+                "days_held":          13,
+                "shares":             50,
+                "fill_price":         200.0,
+                "notional":           10_000.0,
+                "current_price":      190.0,
+                "unrealised_pnl":     -500.0,
+                "unrealised_pnl_pct": -5.0,
+            }
+        ]
+        report = build_daily_report(base_data)
+        assert "-$500" in report
+
+    def test_positions_cash_columns_right_aligned(self, base_data, two_positions):
+        """_usd(603.0) right-justified to _COL_WIDTH must appear in the report."""
+        base_data["open_positions_enriched"] = two_positions
+        report = build_daily_report(base_data)
+        expected = _usd(603.0).rjust(monitor._COL_WIDTH)
+        assert expected in report
+
+    def test_total_unrealised_negative_when_all_positions_down(self, base_data):
+        base_data["open_positions_enriched"] = [
+            {
+                "symbol":             "TSLA",
+                "entry_date":         "2026-04-10",
+                "days_held":          4,
+                "shares":             20,
+                "fill_price":         250.0,
+                "notional":           5_000.0,
+                "current_price":      240.0,
+                "unrealised_pnl":     -200.0,
+                "unrealised_pnl_pct": -4.0,
+            }
+        ]
+        report = build_daily_report(base_data)
+        assert "-$200" in report
+
+    # ── APY ───────────────────────────────────────────────────────────────────
+
+    def test_apy_inception_shown_when_provided(self, base_data):
+        base_data["apy_inception"] = 43.2
+        report = build_daily_report(base_data)
+        assert "APY (inception)" in report
+        assert "+43.2%" in report
+
+    def test_apy_inception_shows_na_when_none(self, base_data):
+        base_data["apy_inception"] = None
+        report = build_daily_report(base_data)
+        assert "APY (inception)" in report
+        assert "n/a" in report
+
+    def test_apy_7d_shows_na_when_none(self, base_data):
+        base_data["apy_7d"] = None
+        report = build_daily_report(base_data)
+        assert "n/a" in report
+
+    def test_apy_30d_shown(self, base_data):
+        base_data["apy_30d"] = 51.4
+        report = build_daily_report(base_data)
+        assert "+51.4%" in report
+
+    def test_apy_90d_shown(self, base_data):
+        base_data["apy_90d"] = 38.1
+        report = build_daily_report(base_data)
+        assert "+38.1%" in report
+
+    def test_apy_all_four_windows_present(self, base_data):
+        """All four APY label lines must appear even when all values are n/a."""
+        report = build_daily_report(base_data)
+        assert "APY (inception)" in report
+        assert "APY (7d)"        in report
+        assert "APY (30d)"       in report
+        assert "APY (90d)"       in report
+
+    def test_apy_negative_value_formatted(self, base_data):
+        base_data["apy_inception"] = -12.3
+        report = build_daily_report(base_data)
+        assert "-12.3%" in report
+
+    # ── Drawdown ──────────────────────────────────────────────────────────────
+
+    def test_drawdown_shown_when_not_none(self, base_data):
+        base_data["drawdown_pct"] = -4.2
+        base_data["ath"]          = 1_052_340.0
+        report = build_daily_report(base_data)
+        assert "Drawdown" in report
+        assert "-4.2%"    in report
+        assert "1,052,340" in report
+
+    def test_drawdown_hidden_when_none(self, base_data):
+        base_data["drawdown_pct"] = None
+        report = build_daily_report(base_data)
+        assert "Drawdown" not in report
+
+    def test_drawdown_absent_key_hidden(self, base_data):
+        # drawdown_pct key not set → hidden
+        report = build_daily_report(base_data)
+        assert "Drawdown" not in report
+
+    # ── Accrued interest ──────────────────────────────────────────────────────
+
+    def test_accrued_interest_shown_when_nonzero(self, base_data):
+        base_data["accrued_interest"] = 124.50
+        report = build_daily_report(base_data)
+        assert "Accrued interest" in report
+        assert "124.50"           in report
+        assert "month-to-date"    in report
+
+    def test_accrued_interest_hidden_when_zero(self, base_data):
+        base_data["accrued_interest"] = 0.0
+        report = build_daily_report(base_data)
+        assert "Accrued interest" not in report
+
+    def test_accrued_interest_absent_key_hidden(self, base_data):
+        report = build_daily_report(base_data)
+        assert "Accrued interest" not in report
+
+    def test_accrued_interest_negative_shown(self, base_data):
+        base_data["accrued_interest"] = -37.80
+        report = build_daily_report(base_data)
+        assert "Accrued interest" in report
+        assert "37.80" in report
+
+    # ── Weekly report parity ──────────────────────────────────────────────────
+
+    def test_weekly_positions_table_shown(self, two_positions):
+        data = {
+            "week_start":   date(2026, 4, 7),
+            "week_end":     date(2026, 4, 11),
+            "equity_start": 1_000_000.0,
+            "equity_end":   1_010_000.0,
+            "exits":        [],
+            "entries":      [],
+            "n_open":       2,
+            "deployed_pct": 0.80,
+            "ytd_pnl":      10_000.0,
+            "ytd_pnl_pct":  1.0,
+            "open_positions_enriched": two_positions,
+        }
+        report = build_weekly_report(data)
+        assert "XOM"              in report
+        assert "Total unrealised" in report
+        assert "+$353"            in report
+
+    def test_weekly_apy_and_drawdown(self):
+        data = {
+            "week_start":    date(2026, 4, 7),
+            "week_end":      date(2026, 4, 11),
+            "equity_start":  1_000_000.0,
+            "equity_end":    1_010_000.0,
+            "exits":         [],
+            "entries":       [],
+            "n_open":        0,
+            "deployed_pct":  0.0,
+            "ytd_pnl":       0.0,
+            "ytd_pnl_pct":   0.0,
+            "apy_inception": 40.0,
+            "apy_7d":        None,
+            "apy_30d":       38.0,
+            "apy_90d":       35.0,
+            "drawdown_pct":  -3.1,
+            "ath":           1_050_000.0,
+        }
+        report = build_weekly_report(data)
+        assert "APY (inception)" in report
+        assert "+40.0%"          in report
+        assert "n/a"             in report
+        assert "Drawdown"        in report
+        assert "-3.1%"           in report
+        assert "1,050,000"       in report
+
+    def test_weekly_accrued_interest_shown(self):
+        data = {
+            "week_start":       date(2026, 4, 7),
+            "week_end":         date(2026, 4, 11),
+            "equity_start":     1_000_000.0,
+            "equity_end":       1_010_000.0,
+            "exits":            [],
+            "entries":          [],
+            "n_open":           0,
+            "deployed_pct":     0.0,
+            "ytd_pnl":          0.0,
+            "ytd_pnl_pct":      0.0,
+            "accrued_interest": 250.75,
+        }
+        report = build_weekly_report(data)
+        assert "Accrued interest" in report
+        assert "250.75"           in report

@@ -640,6 +640,90 @@ class TestReconcileWithIb:
         assert mismatch is True
         assert "AAPL" in detail
 
+    def test_exclude_symbols_prevents_false_positive(self):
+        """Symbols in exclude_symbols are dropped from both sides before comparison."""
+        positions    = []                          # DB: no open positions
+        ib_positions = [{"symbol": "AAPL"}]       # IB: AAPL still showing
+        # Without exclude: mismatch
+        mismatch, _ = main._reconcile_with_ib(positions, ib_positions)
+        assert mismatch is True
+        # With exclude: no mismatch
+        mismatch, _ = main._reconcile_with_ib(
+            positions, ib_positions, exclude_symbols={"AAPL"}
+        )
+        assert mismatch is False
+
+    def test_exclude_does_not_hide_other_mismatches(self):
+        """Excluding AAPL must not hide an unrelated MSFT discrepancy."""
+        positions    = []
+        ib_positions = [{"symbol": "AAPL"}, {"symbol": "MSFT"}]
+        mismatch, detail = main._reconcile_with_ib(
+            positions, ib_positions, exclude_symbols={"AAPL"}
+        )
+        assert mismatch is True
+        assert "MSFT" in detail
+        assert "AAPL" not in detail
+
+    def test_exclude_symbols_defaults_to_empty(self):
+        """Omitting exclude_symbols behaves the same as passing an empty set."""
+        positions    = [{"symbol": "AAPL"}]
+        ib_positions = [{"symbol": "AAPL"}]
+        mismatch, _ = main._reconcile_with_ib(positions, ib_positions)
+        assert mismatch is False
+
+    def test_fill_reconciliation_excludes_exited_today_from_reconciliation(
+        self, monkeypatch, tmp_path
+    ):
+        """
+        fill_reconciliation() must not flag a same-day exit as a reconciliation
+        mismatch: after close_position() the symbol is gone from DB, but IB may
+        still report it until settlement.  Passing exited_today to _reconcile_with_ib
+        must suppress the false positive.
+        """
+        monkeypatch.setattr(config, "DB_DRIVER", "sqlite")
+        monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
+        db.init_db()
+
+        monkeypatch.setattr(main, "bridge", MagicMock())
+        # AAPL was sold today → appears in filled as SELL
+        monkeypatch.setattr(main, "get_filled_orders", MagicMock(return_value={
+            201: {"symbol": "AAPL", "fill_price": 155.0, "fill_qty": 100, "status": "Filled"},
+        }))
+        # IB still shows AAPL (not yet settled)
+        monkeypatch.setattr(main, "get_ib_positions",  MagicMock(return_value=[{"symbol": "AAPL"}]))
+        monkeypatch.setattr(main, "detect_splits",     MagicMock(return_value=[]))
+        monkeypatch.setattr(portfolio_state, "append_equity_snapshot", MagicMock())
+        monkeypatch.setattr(config, "EXPORT_STATE_JSON", False)
+
+        evaluate_calls: list[tuple] = []
+        monkeypatch.setattr(risk_engine, "evaluate", lambda n, c: evaluate_calls.append((n, c)) or True)
+
+        # Pre-insert an open AAPL position so close_position() can find it
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO positions (pos_id, symbol, direction, entry_date, "
+                "fill_price, shares, notional, bars_held) VALUES (?,?,?,?,?,?,?,?)",
+                ("AAPL_2026-01-02", "AAPL", "long", "2026-01-02", 150.0, 100, 15000.0, 5),
+            )
+
+        main._submitted = {
+            201: {
+                "symbol": "AAPL", "action": "SELL",
+                "pos_id": "AAPL_2026-01-02", "shares": 100,
+                "fill_price": 155.0, "reason": "ibs_exit",
+            }
+        }
+        main._snap_state = {
+            "entry_signals": [], "snap_prices": {"AAPL": 155.0},
+            "open_positions": [], "account": {"net_liquidation": 100_000.0},
+        }
+        main.fill_reconciliation()
+
+        reconcile_calls = [c for c in evaluate_calls if c[0] == "reconcile_mismatch"]
+        assert len(reconcile_calls) == 0, (
+            f"Expected no mismatch for same-day exit, got: {reconcile_calls}"
+        )
+
     def test_fill_reconciliation_passes_ib_pos_to_reconciler(self, monkeypatch, tmp_path):
         """
         fill_reconciliation() must use the live IB position list for reconciliation,
@@ -674,3 +758,299 @@ class TestReconcileWithIb:
         reconcile_calls = [c for c in evaluate_calls if c[0] == "reconcile_mismatch"]
         assert len(reconcile_calls) == 1
         assert reconcile_calls[0][1]["mismatch"] is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestBarsHeldPersistence
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBarsHeldPersistence:
+    """
+    Verify that fill_reconciliation() persists updated bars_held / consec_lows
+    for positions that were NOT exited today.
+    """
+
+    @pytest.fixture(autouse=True)
+    def fresh_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "DB_DRIVER", "sqlite")
+        monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
+        db.init_db()
+
+    def _run(self, monkeypatch, snap_open, submitted=None, filled=None):
+        monkeypatch.setattr(main, "bridge",            MagicMock())
+        monkeypatch.setattr(main, "get_filled_orders", MagicMock(return_value=filled or {}))
+        monkeypatch.setattr(main, "get_ib_positions",  MagicMock(return_value=[]))
+        monkeypatch.setattr(main, "detect_splits",     MagicMock(return_value=[]))
+        monkeypatch.setattr(portfolio_state, "append_equity_snapshot", MagicMock())
+        monkeypatch.setattr(risk_engine, "evaluate",   lambda *a, **kw: True)
+        monkeypatch.setattr(config, "EXPORT_STATE_JSON", False)
+
+        main._submitted  = submitted or {}
+        main._snap_state = {
+            "entry_signals": [], "snap_prices": {},
+            "open_positions": snap_open,
+            "account": {"net_liquidation": 100_000.0},
+        }
+        main.fill_reconciliation()
+
+    def test_save_position_called_for_non_exited(self, monkeypatch, tmp_path):
+        """bars_held update in snap_state must be written back to DB."""
+        # Insert a position in DB
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO positions (pos_id, symbol, direction, entry_date, "
+                "fill_price, shares, notional, bars_held, consec_lows) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                ("AAPL_2026-01-02", "AAPL", "long", "2026-01-02",
+                 150.0, 100, 15000.0, 2, 0),
+            )
+
+        # snap_state has the in-memory version with bars_held incremented by get_exit_signals
+        snap_open = [{
+            "pos_id": "AAPL_2026-01-02", "symbol": "AAPL", "direction": "long",
+            "entry_date": "2026-01-02", "fill_price": 150.0, "shares": 100,
+            "notional": 15000.0, "bars_held": 3, "consec_lows": 0,
+        }]
+        self._run(monkeypatch, snap_open)
+
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT bars_held FROM positions WHERE pos_id = 'AAPL_2026-01-02'"
+            ).fetchone()
+        assert row is not None
+        assert row[0] == 3   # updated from 2 → 3
+
+    def test_exited_position_not_saved_back(self, monkeypatch, tmp_path):
+        """A position that was just closed must NOT be re-saved by the bars_held loop."""
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO positions (pos_id, symbol, direction, entry_date, "
+                "fill_price, shares, notional, bars_held, consec_lows) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                ("AAPL_2026-01-02", "AAPL", "long", "2026-01-02",
+                 150.0, 100, 15000.0, 5, 0),
+            )
+
+        snap_open = [{
+            "pos_id": "AAPL_2026-01-02", "symbol": "AAPL", "direction": "long",
+            "entry_date": "2026-01-02", "fill_price": 150.0, "shares": 100,
+            "notional": 15000.0, "bars_held": 6, "consec_lows": 0,
+        }]
+        submitted = {
+            301: {
+                "symbol": "AAPL", "action": "SELL",
+                "pos_id": "AAPL_2026-01-02", "shares": 100,
+                "fill_price": 155.0, "reason": "ibs_exit",
+            }
+        }
+        filled = {
+            301: {"symbol": "AAPL", "fill_price": 155.0, "fill_qty": 100, "status": "Filled"},
+        }
+        self._run(monkeypatch, snap_open, submitted=submitted, filled=filled)
+
+        # Position was closed → row should be gone from positions table
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT bars_held FROM positions WHERE pos_id = 'AAPL_2026-01-02'"
+            ).fetchone()
+        assert row is None   # confirmed closed, not re-inserted
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestDeployedPctFix
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDeployedPctFix:
+    """
+    Verify fill_reconciliation() uses actual fill prices (not snap prices) when
+    computing deployed_pct for newly entered positions.
+    """
+
+    @pytest.fixture(autouse=True)
+    def fresh_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "DB_DRIVER", "sqlite")
+        monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
+        db.init_db()
+
+    def test_deployed_pct_uses_fill_price_not_snap_price(self, monkeypatch):
+        """
+        snap_price = 150, fill_price = 160.  deployed_pct should reflect
+        the fill price (160 × 100 shares = $16 000) not the snap price
+        ($15 000), so the value passed to append_equity_snapshot is higher.
+        """
+        snap_calls: list[tuple] = []
+
+        def _capture_snapshot(*args, **kwargs):
+            snap_calls.append(args)
+
+        monkeypatch.setattr(portfolio_state, "append_equity_snapshot", _capture_snapshot)
+        monkeypatch.setattr(main, "bridge",            MagicMock())
+        monkeypatch.setattr(main, "get_filled_orders", MagicMock(return_value={
+            401: {"symbol": "AAPL", "fill_price": 160.0, "fill_qty": 100, "status": "Filled"},
+        }))
+        monkeypatch.setattr(main, "get_ib_positions",  MagicMock(return_value=[{"symbol": "AAPL"}]))
+        monkeypatch.setattr(main, "detect_splits",     MagicMock(return_value=[]))
+        monkeypatch.setattr(risk_engine, "evaluate",   lambda *a, **kw: True)
+        monkeypatch.setattr(config, "EXPORT_STATE_JSON", False)
+
+        main._submitted = {
+            401: {
+                "symbol": "AAPL", "action": "BUY", "pos_id": "",
+                "shares": 100, "fill_price": 150.0, "reason": "entry",
+                "order_type": "LOC", "limit_price": 155.0,
+            }
+        }
+        main._snap_state = {
+            "entry_signals": [{"symbol": "AAPL", "n_day_ret": 0.08, "ibs_entry": 0.14}],
+            "snap_prices": {"AAPL": 150.0},   # snap price is 150, fill is 160
+            "open_positions": [],
+            "account": {"net_liquidation": 100_000.0},
+        }
+        main.fill_reconciliation()
+
+        assert len(snap_calls) == 1
+        _date, _bod, _eod, _n_pos, deployed_pct = snap_calls[0]
+        # 160 × 100 = 16 000 / 100 000 = 0.16 (not 0.15 from snap price)
+        assert deployed_pct == pytest.approx(0.16)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestDailyReportDeployedPct
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDailyReportDeployedPct:
+    """
+    Verify daily_report() computes deployed_pct from live snap_prices and
+    portfolio_state.get_open_equity(), not from any stale equity_log value.
+    """
+
+    @pytest.fixture(autouse=True)
+    def fresh_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "DB_DRIVER", "sqlite")
+        monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
+        db.init_db()
+
+    def test_deployed_pct_uses_snap_prices_not_equity_log(self, monkeypatch):
+        """
+        Two open positions with fill_price=100 each (100 shares each).
+        snap_prices carry current prices of 120 each → open equity = 24 000.
+        NLV from snap_state = 100 000.
+        Expected deployed_pct in report_data = 24 000 / 100 000 = 0.24.
+
+        The equity_log row carries a stale deployed figure (not present in this
+        test) — if daily_report() were reading from equity_log it would either
+        find 0.0 or a hardcoded value, neither of which is 0.24.
+        """
+        captured: list[dict] = []
+
+        def _capture(data: dict) -> str:
+            captured.append(data)
+            return ""
+
+        monkeypatch.setattr(monitor, "send_report",        MagicMock())
+        monkeypatch.setattr(monitor, "build_daily_report", _capture)
+        monkeypatch.setattr(config, "REPORT_DAILY",  True)
+        monkeypatch.setattr(config, "REPORT_WEEKLY", False)
+
+        # Insert two open positions at fill_price=100, 100 shares each
+        with db.connect() as conn:
+            for i, sym in enumerate(("AAPL", "MSFT"), start=1):
+                conn.execute(
+                    "INSERT INTO positions "
+                    "(pos_id, symbol, direction, entry_date, fill_price, shares, notional, "
+                    "bars_held, order_type, limit_price, qpi_at_entry, ibs_at_entry) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        f"POS_{i}", sym, "long", "2026-04-01",
+                        100.0, 100, 10_000.0, 5,
+                        "LOC", 99.0, 0.05, 0.10,
+                    ),
+                )
+
+        # snap_prices carry current prices of 120 for both symbols
+        main._snap_state = {
+            "account":      {"net_liquidation": 100_000.0, "accrued_interest": 0.0},
+            "snap_prices":  {"AAPL": 120.0, "MSFT": 120.0},
+            "open_positions": [],
+        }
+
+        main.daily_report()
+
+        assert len(captured) == 1
+        deployed = captured[0]["deployed_pct"]
+        # open_equity = 120 × 100 + 120 × 100 = 24 000; NLV = 100 000
+        assert deployed == pytest.approx(0.24)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestWeeklyReport
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestWeeklyReport:
+    """
+    Verify daily_report() calls build_weekly_report() (not build_daily_report())
+    on the configured weekly report day, and passes a week_data dict.
+    """
+
+    @pytest.fixture(autouse=True)
+    def fresh_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "DB_DRIVER", "sqlite")
+        monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
+        db.init_db()
+
+    @pytest.fixture(autouse=True)
+    def patch_externals(self, monkeypatch):
+        self.mock_send_report      = MagicMock()
+        self.mock_build_daily      = MagicMock(return_value="daily text")
+        self.mock_build_weekly     = MagicMock(return_value="weekly text")
+        monkeypatch.setattr(monitor, "send_report",         self.mock_send_report)
+        monkeypatch.setattr(monitor, "build_daily_report",  self.mock_build_daily)
+        monkeypatch.setattr(monitor, "build_weekly_report", self.mock_build_weekly)
+        monkeypatch.setattr(portfolio_state, "load_positions",   MagicMock(return_value=[]))
+        monkeypatch.setattr(portfolio_state, "get_open_equity",  MagicMock(return_value=0.0))
+        monkeypatch.setattr(config, "REPORT_DAILY",  True)
+        monkeypatch.setattr(config, "REPORT_WEEKLY", True)
+        main._snap_state = {"account": {}, "snap_prices": {}}
+
+    def _run_on_friday(self, monkeypatch):
+        from datetime import date
+        # Find a Friday
+        friday = date(2026, 4, 10)   # known Friday
+        with patch("main.date") as mock_date:
+            mock_date.today.return_value = friday
+            mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+            monkeypatch.setattr(config, "REPORT_WEEKLY_DAY", "friday")
+            main.daily_report()
+
+    def test_weekly_day_calls_build_weekly_report(self, monkeypatch):
+        self._run_on_friday(monkeypatch)
+        self.mock_build_weekly.assert_called_once()
+
+    def test_weekly_day_calls_send_report_with_is_weekly_true(self, monkeypatch):
+        self._run_on_friday(monkeypatch)
+        weekly_calls = [
+            c for c in self.mock_send_report.call_args_list
+            if c.kwargs.get("is_weekly") is True or (len(c.args) > 1 and c.args[1] is True)
+        ]
+        assert len(weekly_calls) == 1
+
+    def test_weekly_report_receives_week_start_and_end(self, monkeypatch):
+        self._run_on_friday(monkeypatch)
+        week_data = self.mock_build_weekly.call_args[0][0]
+        assert "week_start" in week_data
+        assert "week_end"   in week_data
+
+    def test_non_weekly_day_does_not_call_build_weekly_report(self, monkeypatch):
+        from datetime import date
+        thursday = date(2026, 4, 9)  # Thursday
+        with patch("main.date") as mock_date:
+            mock_date.today.return_value = thursday
+            mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+            monkeypatch.setattr(config, "REPORT_WEEKLY_DAY", "friday")
+            main.daily_report()
+        self.mock_build_weekly.assert_not_called()
+
+    def test_weekly_report_disabled_config_skips_weekly(self, monkeypatch):
+        monkeypatch.setattr(config, "REPORT_WEEKLY", False)
+        self._run_on_friday(monkeypatch)
+        self.mock_build_weekly.assert_not_called()

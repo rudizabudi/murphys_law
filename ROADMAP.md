@@ -675,6 +675,8 @@ def export_positions_json()                             # Only if EXPORT_STATE_J
 
 At 16:10 ET, live IB positions are compared against the `positions` table. When a discrepancy is found, `fill_reconciliation()` always fires a prominent **critical** `monitor.send_alert()` with subject `"🚨 TRADING HALT — Position Reconciliation Mismatch"` directly — regardless of the risk engine action list. The body states whether a halt was set (governed by `RISK_RECONCILE_HALT`) and includes the full mismatch detail. `risk_engine.evaluate("reconcile_mismatch", ...)` is then called as a second step to execute the configured action (`RISK_RECONCILE_ACTION`).
 
+**Same-day exit exclusion:** `_reconcile_with_ib()` accepts an optional `exclude_symbols: set[str]` parameter. `fill_reconciliation()` builds an `exited_today` set from all SELL fills processed in the same run and passes it as `exclude_symbols`. This prevents false-positive mismatches: after a position is closed, the DB row is gone but IB may still show the symbol until settlement; excluding it from both sides of the comparison avoids a spurious halt.
+
 **Default behaviour (`RISK_RECONCILE_HALT = False`):** The alert fires at critical level but no trading halt is set. This is the safe default for multi-strategy or paper accounts where an IB position mismatch may originate from a separate manual trade and should not suspend the whole system automatically. Set `RISK_RECONCILE_HALT = True` and `RISK_RECONCILE_ACTION = ["halt", "notify"]` to restore the halt-on-mismatch behaviour.
 
 The alert interface in `monitor.py` is a single dispatcher. All risk controls, reconciliation mismatches, fill failures, and circuit breakers call only `send_alert()`. Adding a new channel means adding one `_send_*` function and one `if config.X` line — nothing else changes.
@@ -857,10 +859,17 @@ def get_filled_orders(
 ```python
 def get_account_summary(bridge: IBBridge) -> dict:
     """
-    Returns: {"net_liquidation": float, "cash": float, "buying_power": float}
+    Returns: {
+        "net_liquidation":  float,
+        "cash":             float,
+        "buying_power":     float,
+        "accrued_interest": float,   # month-to-date accrued cash interest (AccruedCash tag)
+    }
     Cross-checks computed equity vs IB reported equity at 16:10 ET.
     """
 ```
+
+`_ACCOUNT_TAGS` requests `NetLiquidation,TotalCashValue,BuyingPower,AccruedCash` from IB. The `accrued_interest` value is stored in `_snap_state["account"]` and forwarded to the daily/weekly report footer (shown only when non-zero).
 
 When `config.IB_SUBACCOUNT` is non-empty, `reqAccountSummary()` is called with that account ID instead of `"All"`, so the returned equity and buying power figures reflect the subaccount rather than the consolidated master account.
 
@@ -1024,6 +1033,8 @@ The same `logger` instance is imported across all modules. No `print()` statemen
 
 Report is built as structured data first, rendered to plain text second — same content reused for email, Discord, and future web dashboard without duplication.
 
+**Daily report** (`build_daily_report(data)`):
+
 ```
 Murphy's Law — Daily Report 2026-03-28
 ────────────────────────────────────────
@@ -1040,11 +1051,58 @@ Entries today:      2
   SMCI  LOC buy   87 shares @ limit $28.11  [QPI=0.06, IBS=0.11]
 
 Open positions:     13 / 15
+────────────────────────────────────────────────────────────────────────
+  Symbol   Entry        Days      Cost       Price  Unreal P&L        %
+  XOM      2026-04-09      5   $155.17    $161.20      +$603     +3.9%
+  CVX      2026-04-07      7   $200.00    $195.00      -$250     -2.5%
+────────────────────────────────────────────────────────────────────────
+  Total unrealised                                      +$353     +1.4%
+
 Total deployed:     132.4% of equity
+
+APY (inception):   +43.2%   APY (90d):   +38.1%
+APY (7d):             n/a   APY (30d):   +51.4%
+Drawdown: -4.2%  from ATH $1,052,340
+Accrued interest: +$124.50  (month-to-date)
 
 YTD P&L:  +$92,500  (+12.3%)
 ────────────────────────────────────────
 ```
+
+- **Positions table** (`open_positions_enriched`): rendered when the key is present and non-empty. Current price uses `snap_prices` from the 15:40 snap; `unrealised_pnl` and `unrealised_pnl_pct` are computed in `daily_report()`. All cash columns are right-justified to `_COL_WIDTH = 10`.
+- **APY rows** always rendered (four windows). `None` → `"n/a"`. Computed from `equity_log` in `daily_report()`:
+  - *inception*: requires ≥ 30 trading-day rows; uses first row as start.
+  - *7d / 30d / 90d*: require ≥ 7 / 30 / 90 rows respectively; use the N-th row from the end.
+- **Drawdown** shown only when `drawdown_pct` is not `None` (i.e. `equity_eod < ATH`).
+- **Accrued interest** shown only when non-zero; formatted with 2 decimal places (`_usd2()`).
+
+**Weekly report** (`build_weekly_report(data)`) — sent on `REPORT_WEEKLY_DAY` instead of reusing the daily format. `daily_report()` queries `equity_log`, `trade_log`, and `positions` for the full Monday→today window and passes a `week_data` dict. The weekly report includes the same positions table, APY rows, drawdown, and accrued interest as the daily report.
+
+```
+Murphy's Law — Weekly Report  2026-04-06 → 2026-04-10
+────────────────────────────────────────
+Equity (week start): $840,000
+Equity (week end):   $855,000   +$15,000  (+1.8%)
+
+Exits this week:    3  ...
+
+Entries this week:  2  ...
+
+Open positions:     13 / 15
+[positions table — same format as daily]
+
+Total deployed:     132.4% of equity
+
+APY (inception):  +43.2%   APY (90d):  +38.1%
+APY (7d):            n/a   APY (30d):  +51.4%
+Drawdown: -4.2%  from ATH $1,052,340
+Accrued interest: +$124.50  (month-to-date)
+
+YTD P&L:  +$92,500  (+12.3%)
+────────────────────────────────────────
+```
+
+`report_data` / `week_data` keys: `date` (daily) or `week_start`/`week_end` (weekly), `equity_bod`/`equity_eod` (daily) or `equity_start`/`equity_end` (weekly), `exits`, `entries`, `n_open`, `deployed_pct`, `ytd_pnl`, `ytd_pnl_pct`, `open_positions_enriched`, `apy_inception`, `apy_7d`, `apy_30d`, `apy_90d`, `ath`, `drawdown_pct`, `accrued_interest`.
 
 ```python
 def send_report(report_text: str, is_weekly: bool = False):
@@ -1052,6 +1110,10 @@ def send_report(report_text: str, is_weekly: bool = False):
     subject = "Murphy's Law — Weekly Report" if is_weekly else "Murphy's Law — Daily Report"
     send_alert(subject, report_text, level="info")
 ```
+
+**`_pct()` formatting:** values with `abs(v) < 0.05` override to 2 decimal places so tiny returns (e.g. `+0.03%`) are not truncated to `+0.0%`. Values ≥ 0.05 use the `decimals` argument (default 1). A `-0.0` guard returns `"0.0%"` directly.
+
+**`_usd2()` formatting:** like `_usd()` but with two decimal places — used for accrued interest.
 
 #### 4.9.3 Alert Dispatcher
 

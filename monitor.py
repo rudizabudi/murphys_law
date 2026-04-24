@@ -28,9 +28,10 @@ import config
 logger = logging.getLogger("murphy")
 
 # ── Report formatting constants ───────────────────────────────────────────────
-_RULE   = "─" * 40
+_RULE          = "─" * 40
 _DISCORD_MAX   = 2000
-_CODE_OVERHEAD = 8   # len("```\n") + len("\n```")
+_CODE_OVERHEAD = 8    # len("```\n") + len("\n```")
+_COL_WIDTH     = 10   # right-justify width for cash/price columns
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -209,9 +210,22 @@ def build_daily_report(data: dict) -> str:
     exits         : list of {symbol, exit_reason, pnl, bars_held}
     entries       : list of {symbol, order_type, shares, limit_price | None, qpi, ibs}
     n_open        : int   (current open position count)
-    deployed_pct  : float (e.g. 132.4 → "132.4% of equity")
+    deployed_pct  : float (fraction, e.g. 1.324 → "132.4% of NLV")
     ytd_pnl       : float (absolute YTD P&L in $)
     ytd_pnl_pct   : float (e.g. 12.3 → "12.3%")
+
+    Optional enrichment keys
+    ────────────────────────
+    open_positions_enriched : list[dict]  each entry has symbol, entry_date, days_held,
+                              shares, fill_price, notional, current_price,
+                              unrealised_pnl, unrealised_pnl_pct — table omitted if absent
+    apy_inception   : float | None  (n/a when None; requires ≥30 trading days)
+    apy_7d          : float | None
+    apy_30d         : float | None
+    apy_90d         : float | None
+    ath             : float  (all-time-high equity for drawdown)
+    drawdown_pct    : float | None  (shown only when not None)
+    accrued_interest : float  (shown only when non-zero)
 
     No DB calls inside this function — structured data in, string out.
     """
@@ -227,6 +241,15 @@ def build_daily_report(data: dict) -> str:
     deployed_pct = float(data.get("deployed_pct", 0.0))
     ytd_pnl      = float(data.get("ytd_pnl",      0.0))
     ytd_pnl_pct  = float(data.get("ytd_pnl_pct",  0.0))
+
+    open_positions_enriched = data.get("open_positions_enriched", [])
+    apy_inception    = data.get("apy_inception")
+    apy_7d           = data.get("apy_7d")
+    apy_30d          = data.get("apy_30d")
+    apy_90d          = data.get("apy_90d")
+    ath              = float(data.get("ath", 0.0))
+    drawdown_pct     = data.get("drawdown_pct")
+    accrued_interest = float(data.get("accrued_interest", 0.0))
 
     lines = [
         f"Murphy's Law \u2014 Daily Report {report_date}",
@@ -263,12 +286,208 @@ def build_daily_report(data: dict) -> str:
             f"  [QPI={en['qpi']:.2f}, IBS={en['ibs']:.2f}]"
         )
 
+    lines.append("")
+    lines.append(f"Open positions:     {n_open} / {config.MAX_POSITIONS}")
+
+    if open_positions_enriched:
+        _pos_rule = "─" * 72
+        lines.append(_pos_rule)
+        lines.append(
+            f"  {'Symbol':<7}  {'Entry':<10}  {'Days':>4}"
+            f"  {'Cost':>{_COL_WIDTH}}"
+            f"  {'Price':>{_COL_WIDTH}}"
+            f"  {'Unreal P&L':>{_COL_WIDTH}}"
+            f"  {'%':>7}"
+        )
+        for pos in open_positions_enriched:
+            fp         = float(pos.get("fill_price",    0.0))
+            cp         = float(pos.get("current_price", 0.0))
+            unreal     = float(pos.get("unrealised_pnl",     0.0))
+            unreal_pct = float(pos.get("unrealised_pnl_pct", 0.0))
+            lines.append(
+                f"  {pos.get('symbol', ''):<7}"
+                f"  {str(pos.get('entry_date', '')):<10}"
+                f"  {int(pos.get('days_held', 0)):>4}"
+                f"  {('$' + f'{fp:,.2f}'):>{_COL_WIDTH}}"
+                f"  {('$' + f'{cp:,.2f}'):>{_COL_WIDTH}}"
+                f"  {_usd(unreal):>{_COL_WIDTH}}"
+                f"  {_pct(unreal_pct):>7}"
+            )
+        total_unreal   = sum(float(p.get("unrealised_pnl",  0.0)) for p in open_positions_enriched)
+        total_notional = sum(float(p.get("notional",        0.0)) for p in open_positions_enriched)
+        total_pct      = (total_unreal / total_notional * 100.0) if total_notional else 0.0
+        lines.append(_pos_rule)
+        lines.append(
+            f"  {'Total unrealised':<49}"
+            f"  {_usd(total_unreal):>{_COL_WIDTH}}"
+            f"  {_pct(total_pct):>7}"
+        )
+
+    def _apy_str(v: float | None) -> str:
+        return _pct(v, 1) if v is not None else "n/a"
+
     lines += [
         "",
-        f"Open positions:     {n_open} / {config.MAX_POSITIONS}",
-        f"Total deployed:     {deployed_pct:.1f}% of equity",
+        f"Total deployed:     {deployed_pct * 100:.1f}% of NLV",
+        "",
+        f"APY (inception):  {_apy_str(apy_inception):>7}   APY (90d):  {_apy_str(apy_90d):>7}",
+        f"APY (7d):         {_apy_str(apy_7d):>7}   APY (30d):  {_apy_str(apy_30d):>7}",
+    ]
+
+    if drawdown_pct is not None:
+        lines.append(f"Drawdown: {_pct(drawdown_pct, 1)}  from ATH ${ath:,.0f}")
+
+    if accrued_interest:
+        lines.append(f"Accrued interest: {_usd2(accrued_interest)}  (month-to-date)")
+
+    lines += [
         "",
         f"YTD P\u0026L:  {_usd(ytd_pnl)}  ({_pct(ytd_pnl_pct, 1)})",
+        _RULE,
+    ]
+
+    return "\n".join(lines)
+
+
+def build_weekly_report(data: dict) -> str:
+    """
+    Render structured data into the plain-text weekly report format.
+
+    Expected keys in *data*
+    ───────────────────────
+    week_start    : datetime.date or str  (Monday of this week)
+    week_end      : datetime.date or str  (today, typically Friday)
+    equity_start  : float  (equity at start of week — BOD Monday or first available)
+    equity_end    : float  (equity at end of week)
+    exits         : list of {symbol, exit_reason, pnl, bars_held}
+    entries       : list of {symbol, order_type, shares, limit_price | None, qpi, ibs}
+    n_open        : int
+    deployed_pct  : float  (fraction, e.g. 1.324 → "132.4% of NLV")
+    ytd_pnl       : float
+    ytd_pnl_pct   : float
+
+    Optional enrichment keys (same as build_daily_report)
+    ────────────────────────────────────────────────────
+    open_positions_enriched, apy_inception, apy_7d, apy_30d, apy_90d,
+    ath, drawdown_pct, accrued_interest
+
+    No DB calls inside this function — structured data in, string out.
+    """
+    week_start    = data.get("week_start", "")
+    week_end      = data.get("week_end",   date.today())
+    equity_start  = float(data.get("equity_start", 0.0))
+    equity_end    = float(data.get("equity_end",   0.0))
+    eq_change     = equity_end - equity_start
+    eq_change_pct = (eq_change / equity_start * 100.0) if equity_start else 0.0
+
+    exits        = data.get("exits",   [])
+    entries      = data.get("entries", [])
+    n_open       = data.get("n_open",  0)
+    deployed_pct = float(data.get("deployed_pct", 0.0))
+    ytd_pnl      = float(data.get("ytd_pnl",      0.0))
+    ytd_pnl_pct  = float(data.get("ytd_pnl_pct",  0.0))
+
+    open_positions_enriched = data.get("open_positions_enriched", [])
+    apy_inception    = data.get("apy_inception")
+    apy_7d           = data.get("apy_7d")
+    apy_30d          = data.get("apy_30d")
+    apy_90d          = data.get("apy_90d")
+    ath              = float(data.get("ath", 0.0))
+    drawdown_pct     = data.get("drawdown_pct")
+    accrued_interest = float(data.get("accrued_interest", 0.0))
+
+    lines = [
+        f"Murphy's Law \u2014 Weekly Report  {week_start} \u2192 {week_end}",
+        _RULE,
+        f"Equity (week start): ${equity_start:,.0f}",
+        (
+            f"Equity (week end):   ${equity_end:,.0f}"
+            f"   {_usd(eq_change)}"
+            f"  ({_pct(eq_change_pct)})"
+        ),
+        "",
+        f"Exits this week:    {len(exits)}",
+    ]
+
+    for ex in exits:
+        lines.append(
+            f"  {ex['symbol']:<6}"
+            f"  {ex['exit_reason']:<20}"
+            f"  {_usd(ex['pnl'])}"
+            f"   ({ex['bars_held']} bars)"
+        )
+
+    lines.append("")
+    lines.append(f"Entries this week:  {len(entries)}")
+
+    for en in entries:
+        lp = en.get("limit_price")
+        price_str = f"@ limit ${lp:.2f}" if lp is not None else "(MOC)"
+        lines.append(
+            f"  {en['symbol']:<6}"
+            f"  {en['order_type']} buy"
+            f"  {en['shares']:>4} shares"
+            f" {price_str}"
+            f"  [QPI={en['qpi']:.2f}, IBS={en['ibs']:.2f}]"
+        )
+
+    lines.append("")
+    lines.append(f"Open positions:     {n_open} / {config.MAX_POSITIONS}")
+
+    if open_positions_enriched:
+        _pos_rule = "─" * 72
+        lines.append(_pos_rule)
+        lines.append(
+            f"  {'Symbol':<7}  {'Entry':<10}  {'Days':>4}"
+            f"  {'Cost':>{_COL_WIDTH}}"
+            f"  {'Price':>{_COL_WIDTH}}"
+            f"  {'Unreal P&L':>{_COL_WIDTH}}"
+            f"  {'%':>7}"
+        )
+        for pos in open_positions_enriched:
+            fp         = float(pos.get("fill_price",    0.0))
+            cp         = float(pos.get("current_price", 0.0))
+            unreal     = float(pos.get("unrealised_pnl",     0.0))
+            unreal_pct = float(pos.get("unrealised_pnl_pct", 0.0))
+            lines.append(
+                f"  {pos.get('symbol', ''):<7}"
+                f"  {str(pos.get('entry_date', '')):<10}"
+                f"  {int(pos.get('days_held', 0)):>4}"
+                f"  {('$' + f'{fp:,.2f}'):>{_COL_WIDTH}}"
+                f"  {('$' + f'{cp:,.2f}'):>{_COL_WIDTH}}"
+                f"  {_usd(unreal):>{_COL_WIDTH}}"
+                f"  {_pct(unreal_pct):>7}"
+            )
+        total_unreal   = sum(float(p.get("unrealised_pnl",  0.0)) for p in open_positions_enriched)
+        total_notional = sum(float(p.get("notional",        0.0)) for p in open_positions_enriched)
+        total_pct      = (total_unreal / total_notional * 100.0) if total_notional else 0.0
+        lines.append(_pos_rule)
+        lines.append(
+            f"  {'Total unrealised':<49}"
+            f"  {_usd(total_unreal):>{_COL_WIDTH}}"
+            f"  {_pct(total_pct):>7}"
+        )
+
+    def _apy_str(v: float | None) -> str:
+        return _pct(v, 1) if v is not None else "n/a"
+
+    lines += [
+        "",
+        f"Total deployed:     {deployed_pct * 100:.1f}% of NLV",
+        "",
+        f"APY (inception):  {_apy_str(apy_inception):>7}   APY (90d):  {_apy_str(apy_90d):>7}",
+        f"APY (7d):         {_apy_str(apy_7d):>7}   APY (30d):  {_apy_str(apy_30d):>7}",
+    ]
+
+    if drawdown_pct is not None:
+        lines.append(f"Drawdown: {_pct(drawdown_pct, 1)}  from ATH ${ath:,.0f}")
+
+    if accrued_interest:
+        lines.append(f"Accrued interest: {_usd2(accrued_interest)}  (month-to-date)")
+
+    lines += [
+        "",
+        f"YTD P\u0026L:  {_usd(ytd_pnl)}  ({_pct(ytd_pnl_pct)})",
         _RULE,
     ]
 
@@ -282,7 +501,22 @@ def _usd(v: float) -> str:
     return f"+${v:,.0f}" if v >= 0 else f"-${abs(v):,.0f}"
 
 
-def _pct(v: float, decimals: int) -> str:
-    """Format as +0.74% or -1.23% with the requested decimal places."""
+def _usd2(v: float) -> str:
+    """Format as +$1,234.50 or -$1,234.50 (two decimal places)."""
+    return f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+
+
+def _pct(v: float, decimals: int = 1) -> str:
+    """
+    Format as +0.74% or -1.23%.
+
+    - If abs(v) < 0.05, overrides to 2 decimal places so tiny values are
+      not rendered as '0.0%'.
+    - Otherwise uses the requested *decimals* (default 1).
+    - Guards against -0.0 by testing equality before choosing the sign.
+    """
+    if v == 0.0:
+        return "0.0%"
+    effective_decimals = 2 if abs(v) < 0.05 else decimals
     sign = "+" if v >= 0 else ""
-    return f"{sign}{v:.{decimals}f}%"
+    return f"{sign}{v:.{effective_decimals}f}%"

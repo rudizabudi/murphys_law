@@ -51,7 +51,7 @@ logger = logging.getLogger("murphy")
 SENTINEL = object()
 
 # ── Account tags requested from IB ───────────────────────────────────────────
-_ACCOUNT_TAGS = "NetLiquidation,TotalCashValue,BuyingPower"
+_ACCOUNT_TAGS = "NetLiquidation,TotalCashValue,BuyingPower,AccruedCash"
 
 # ── Default timeout for blocking queue reads (seconds) ───────────────────────
 _DEFAULT_TIMEOUT = 15
@@ -496,12 +496,16 @@ def get_account_summary(bridge: IBBridge) -> dict:
         raw[item["tag"]] = item["value"]
 
     result = {
-        "net_liquidation": float(raw.get("NetLiquidation", 0)),
-        "cash":            float(raw.get("TotalCashValue",  0)),
-        "buying_power":    float(raw.get("BuyingPower",     0)),
+        "net_liquidation":  float(raw.get("NetLiquidation", 0)),
+        "cash":             float(raw.get("TotalCashValue",  0)),
+        "buying_power":     float(raw.get("BuyingPower",     0)),
+        "accrued_interest": float(raw.get("AccruedCash",     0)),
     }
-    logger.info("[ib] account summary: nlv=%.2f cash=%.2f bp=%.2f",
-                result["net_liquidation"], result["cash"], result["buying_power"])
+    logger.info(
+        "[ib] account summary: nlv=%.2f cash=%.2f bp=%.2f accrued=%.2f",
+        result["net_liquidation"], result["cash"],
+        result["buying_power"], result["accrued_interest"],
+    )
     return result
 
 

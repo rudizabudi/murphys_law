@@ -329,14 +329,32 @@ def startup_catchup() -> None:
         logger.info("[startup_catchup] universe up to date (last=%s)", last_update.date())
 
     # ── Nightly data catch-up ─────────────────────────────────────────────────
-    max_bar_date = None
+    max_bar_date  = None
+    total_count   = None
+    updated_count = None
+    threshold = 0.9
     try:
         with db.connect() as conn:
             row = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
             if row and row[0]:
                 max_bar_date = row[0]
+            
+            row = conn.execute("SELECT COUNT(date) FROM daily_bars").fetchone()
+            if row and row[0]:
+                total_count = row[0]
+
+            row = conn.execute("SELECT COUNT(date) FROM daily_bars WHERE date = ?", (max_bar_date,)).fetchone()
+            if row and row[0]:
+                updated_count = row[0]
+
     except Exception as exc:
-        logger.warning("[startup_catchup] could not read MAX(date) from daily_bars: %s", exc)
+        logger.warning("[startup_catchup] could not request dates from daily_bars: %s", exc)
+    
+    uniformity = None
+    if total_count is not None and updated_count is not None and total_count * threshold <= updated_count:
+        uniformity = True
+    else:
+        uniformity = False
 
     last_close_date = None
     try:
@@ -352,14 +370,14 @@ def startup_catchup() -> None:
     except Exception as exc:
         logger.warning("[startup_catchup] could not determine last NYSE close: %s", exc)
 
-    if max_bar_date is not None and last_close_date is not None:
+    if max_bar_date is not None and last_close_date is not None and uniformity is not None:
         from datetime import date as _date
         max_date = (
             _date.fromisoformat(max_bar_date)
             if isinstance(max_bar_date, str)
             else max_bar_date
         )
-        if max_date < last_close_date:
+        if max_date < last_close_date or uniformity is False:
             gap_days = (now.date() - max_date).days
             n_days   = gap_days + 2
             symbols  = main._load_universe()
@@ -602,7 +620,14 @@ def build_scheduler() -> BlockingScheduler:
 if __name__ == "__main__":
     monitor.setup_logging()
 
-    subprocess.Popen(["uv", "--directory", config.API_CONTROLLER_PATH, "run", "main.py"])        
+    cmd = ["uv", "--directory", config.API_CONTROLLER_PATH, "run", "main.py"]
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL, 
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True  
+    )        
     time.sleep(2)
     
     logger.info("[scheduler] Connecting to IB TWS/Gateway")
