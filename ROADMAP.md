@@ -755,6 +755,15 @@ def build_entry_orders(
 
 Note on deployed capital for the total notional gate: use **mark-to-market values** of open positions at the 15:40 snap price — not entry prices. This matches the backtest's `close_map` calculation and keeps leverage accurate.
 
+**Pending-exit notional credit** — when `exit_orders` is supplied, their notional (`quantity × snap_price`) is subtracted from the deployed total before the gate check.  Rationale: exits and entries fire at the same MOC session, so the exiting positions' capital is freed at auction close.  The gate becomes:
+
+```
+effective_deployed = max(0, deployed_mtm − exit_credit)
+(effective_deployed + new_notional) / equity ≤ MAX_TOTAL_NOTIONAL
+```
+
+This prevents the bot from holding entry orders hostage to capital already earmarked for release.  `exit_orders=None` (default) leaves behaviour unchanged.
+
 #### 4.6.3 Closing Auction Imbalance Filter (optional)
 
 Controlled by `RISK_IMBALANCE_ENABLED` (default `False`). When enabled, fetches NYSE/NASDAQ imbalance data between signal snap and order submission. Candidates with an adverse imbalance ratio above `RISK_IMBALANCE_THRESHOLD` are handled per `RISK_IMBALANCE_ACTION` (default: `["reject"]`). Measure fill rate impact during paper trading before enabling in production.

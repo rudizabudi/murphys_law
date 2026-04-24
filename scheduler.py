@@ -329,32 +329,14 @@ def startup_catchup() -> None:
         logger.info("[startup_catchup] universe up to date (last=%s)", last_update.date())
 
     # ── Nightly data catch-up ─────────────────────────────────────────────────
-    max_bar_date  = None
-    total_count   = None
-    updated_count = None
-    threshold = 0.9
+    max_bar_date = None
     try:
         with db.connect() as conn:
             row = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
             if row and row[0]:
                 max_bar_date = row[0]
-            
-            row = conn.execute("SELECT COUNT(date) FROM daily_bars").fetchone()
-            if row and row[0]:
-                total_count = row[0]
-
-            row = conn.execute("SELECT COUNT(date) FROM daily_bars WHERE date = ?", (max_bar_date,)).fetchone()
-            if row and row[0]:
-                updated_count = row[0]
-
     except Exception as exc:
         logger.warning("[startup_catchup] could not request dates from daily_bars: %s", exc)
-    
-    uniformity = None
-    if total_count is not None and updated_count is not None and total_count * threshold <= updated_count:
-        uniformity = True
-    else:
-        uniformity = False
 
     last_close_date = None
     try:
@@ -370,27 +352,33 @@ def startup_catchup() -> None:
     except Exception as exc:
         logger.warning("[startup_catchup] could not determine last NYSE close: %s", exc)
 
-    if max_bar_date is not None and last_close_date is not None and uniformity is not None:
+    if max_bar_date is not None and last_close_date is not None:
         from datetime import date as _date
         max_date = (
             _date.fromisoformat(max_bar_date)
             if isinstance(max_bar_date, str)
             else max_bar_date
         )
-        if max_date < last_close_date or uniformity is False:
+        if max_date < last_close_date:
             gap_days = (now.date() - max_date).days
-            n_days   = gap_days + 2
-            symbols  = main._load_universe()
-            logger.info(
-                "[startup_catchup] startup catch-up sync: DB last date=%s, "
-                "last market close=%s, fetching %d days",
-                max_date, last_close_date, n_days,
-            )
-            try:
-                td_data.fetch_incremental(symbols, n_days=n_days)
-                main.precompute_watchlist()
-            except Exception as exc:
-                logger.warning("[startup_catchup] catch-up sync failed: %s", exc)
+            if gap_days <= 0:
+                logger.debug(
+                    "[startup_catchup] skipping data catch-up: gap_days=%d (non-positive)",
+                    gap_days,
+                )
+            else:
+                n_days  = gap_days + 2
+                symbols = main._load_universe()
+                logger.info(
+                    "[startup_catchup] startup catch-up sync: DB last date=%s, "
+                    "last market close=%s, fetching %d days",
+                    max_date, last_close_date, n_days,
+                )
+                try:
+                    td_data.fetch_incremental(symbols, n_days=n_days)
+                    main.precompute_watchlist()
+                except Exception as exc:
+                    logger.warning("[startup_catchup] catch-up sync failed: %s", exc)
         else:
             logger.debug("[startup_catchup] DB is current (last date=%s)", max_bar_date)
     else:

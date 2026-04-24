@@ -563,6 +563,7 @@ def order_submission() -> None:
             open_positions,
             current_equity,
             snap_prices,
+            exit_orders=exit_orders,
         )
         for order in entry_orders:
             # Per-order risk: max single order value

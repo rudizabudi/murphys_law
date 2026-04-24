@@ -87,6 +87,7 @@ def build_entry_orders(
     current_equity: float,
     snap_prices: dict[str, float],
     imbalance_data: dict[str, float] | None = None,
+    exit_orders: list[Order] | None = None,
 ) -> list[Order]:
     """
     Direct port of the entry sizing and gate logic from simulate_portfolio().
@@ -120,6 +121,10 @@ def build_entry_orders(
         Optional per-symbol imbalance ratios.  Required when
         config.RISK_IMBALANCE_ENABLED is True; if None, the imbalance check
         is skipped even when enabled.
+    exit_orders : list[Order] | None
+        Exit orders built in the same session.  Their notional is subtracted
+        from the deployed total before the gate — these positions close at the
+        same MOC, so their capital is effectively freed for new entries.
     """
     if current_equity <= 0:
         logger.warning("[om] build_entry_orders: current_equity <= 0, no orders built")
@@ -149,6 +154,13 @@ def build_entry_orders(
     # accurate across multiple new entries built in the same call.
     sim_positions  = list(positions)   # shallow copy; we only append, never mutate
     orders: list[Order] = []
+
+    # Pending-exit credit: exits fire at the same MOC, so those positions'
+    # capital is freed.  Subtract from deployed before the total-notional gate.
+    exit_credit = (
+        sum(o.quantity * snap_prices.get(o.symbol, 0.0) for o in exit_orders)
+        if exit_orders else 0.0
+    )
 
     for sig in candidates:
         if len(sim_positions) >= config.MAX_POSITIONS:
@@ -186,9 +198,10 @@ def build_entry_orders(
             int(p["shares"]) * float(snap_prices.get(p["symbol"], p["fill_price"]))
             for p in sim_positions
         )
-        if (deployed + notional) / current_equity > config.MAX_TOTAL_NOTIONAL:
-            logger.debug("[om] %s: total notional gate (deployed=%.0f new=%.0f equity=%.0f)",
-                         sym, deployed, notional, current_equity)
+        effective_deployed = max(0.0, deployed - exit_credit)
+        if (effective_deployed + notional) / current_equity > config.MAX_TOTAL_NOTIONAL:
+            logger.debug("[om] %s: total notional gate (deployed=%.0f credit=%.0f new=%.0f equity=%.0f)",
+                         sym, deployed, exit_credit, notional, current_equity)
             continue
 
         # ── g. Optional imbalance filter ─────────────────────────────────────

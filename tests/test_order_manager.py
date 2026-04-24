@@ -382,6 +382,71 @@ class TestEntryGates:
         # deployed_mtm = 500 × 200 = 100_000; budget = 100_000 → no room
         assert orders == []
 
+    def test_exit_credit_allows_entry_when_exits_free_notional(self, monkeypatch):
+        """
+        Without exit credit:
+          deployed = 950×100 = 95_000; new = 66×100 = 6_600
+          95_000 + 6_600 = 101_600 > 100_000 → blocked.
+        With exit_orders for HELD1 (950 shares × 100 = 95_000 credit):
+          effective_deployed = max(0, 95_000 − 95_000) = 0
+          0 + 6_600 = 6_600 ≤ 100_000 → entry passes.
+        """
+        self._base_monkeypatch(monkeypatch)
+        monkeypatch.setattr(config, "MAX_TOTAL_NOTIONAL", 1.0)
+        monkeypatch.setattr(config, "LIQUIDITY_ADV_MAX_PCT", 0)
+
+        equity      = 100_000.0
+        positions   = [{"symbol": "HELD1", "shares": 950, "fill_price": 100.0}]
+        snap_prices = {"HELD1": 100.0, "AAPL": 100.0}
+
+        sig = _make_entry_signal(symbol="AAPL", fill_price=100.0, adv63=0)
+
+        # Confirm it is blocked without exit credit
+        orders_no_credit = build_entry_orders([sig], positions, equity, snap_prices)
+        assert orders_no_credit == [], "expected gate to block without exit credit"
+
+        # With exit credit the entry should proceed
+        exit_order = Order(
+            symbol="HELD1", action="SELL", order_type="MOC",
+            quantity=950, limit_price=None, reason="exit", pos_id="P1",
+        )
+        orders = build_entry_orders(
+            [sig], positions, equity, snap_prices, exit_orders=[exit_order]
+        )
+        assert len(orders) == 1
+        assert orders[0].symbol == "AAPL"
+
+    def test_exit_credit_insufficient_still_blocks_entry(self, monkeypatch):
+        """
+        deployed = 950×100 + 30×100 = 98_000; new = 66×100 = 6_600.
+        98_000 + 6_600 = 104_600 > 100_000 → blocked without credit.
+        Exit credit for small HELD2 only: 30×100 = 3_000.
+        effective_deployed = 98_000 − 3_000 = 95_000.
+        95_000 + 6_600 = 101_600 > 100_000 → still blocked.
+        """
+        self._base_monkeypatch(monkeypatch)
+        monkeypatch.setattr(config, "MAX_TOTAL_NOTIONAL", 1.0)
+        monkeypatch.setattr(config, "LIQUIDITY_ADV_MAX_PCT", 0)
+
+        equity = 100_000.0
+        positions = [
+            {"symbol": "HELD1", "shares": 950, "fill_price": 100.0},
+            {"symbol": "HELD2", "shares":  30, "fill_price": 100.0},
+        ]
+        snap_prices = {"HELD1": 100.0, "HELD2": 100.0, "AAPL": 100.0}
+
+        sig = _make_entry_signal(symbol="AAPL", fill_price=100.0, adv63=0)
+
+        # Small credit (HELD2 only) is not enough to clear the gate
+        exit_order = Order(
+            symbol="HELD2", action="SELL", order_type="MOC",
+            quantity=30, limit_price=None, reason="exit", pos_id="P2",
+        )
+        orders = build_entry_orders(
+            [sig], positions, equity, snap_prices, exit_orders=[exit_order]
+        )
+        assert orders == []
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TestEntryOrderType — LOC vs MOC
