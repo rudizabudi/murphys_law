@@ -29,6 +29,7 @@ Usage
 """
 
 import logging
+import math
 import subprocess
 import threading
 import time
@@ -53,6 +54,17 @@ _nyse = mcal.get_calendar("NYSE")
 
 # ── Running scheduler reference — set by build_scheduler(), used by market_open_check()
 _scheduler: BlockingScheduler | None = None
+
+# ── Intraday job completion tracker — prevents duplicate runs within the same day.
+# Keyed by job_id ("signal_snap", etc.); value is the date the job last ran successfully.
+# Reset at 11:00 ET by market_open_check() so each trading day starts fresh.
+_jobs_run_today: dict[str, date] = {}
+
+
+def _reset_daily_job_tracker() -> None:
+    """Clear _jobs_run_today. Called by market_open_check at 11:00 ET each trading day."""
+    _jobs_run_today.clear()
+    logger.debug("[scheduler] _jobs_run_today reset for new trading day")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -138,18 +150,22 @@ def job_nightly_sync() -> None:
 
 def job_signal_snap() -> None:
     main.signal_snap()
+    _jobs_run_today["signal_snap"] = date.today()
 
 
 def job_order_submission() -> None:
     main.order_submission()
+    _jobs_run_today["order_submission"] = date.today()
 
 
 def job_fill_reconciliation() -> None:
     main.fill_reconciliation()
+    _jobs_run_today["fill_reconciliation"] = date.today()
 
 
 def job_daily_report() -> None:
     main.daily_report()
+    _jobs_run_today["daily_report"] = date.today()
 
 
 def job_sunday_universe_update() -> None:
@@ -187,6 +203,8 @@ def market_open_check() -> None:
     if not sched["is_open"]:
         logger.info("[scheduler] market_open_check: not a trading day — skipping")
         return
+
+    _reset_daily_job_tracker()
 
     close_time = sched["close_time"]
     logger.info(
@@ -290,10 +308,16 @@ def startup_catchup() -> None:
         t_fill  = close_time + timedelta(minutes=config.SCHED_FILL_OFFSET_MIN)
 
         if t_check <= now < t_fill:
-            logger.info(
-                "[startup_catchup] started after 11:00 ET on trading day — calling market_open_check()"
-            )
-            market_open_check()
+            if (_jobs_run_today.get("fill_reconciliation") == now.date() or
+                    _jobs_run_today.get("daily_report") == now.date()):
+                logger.debug(
+                    "[startup_catchup] intraday jobs already ran today — skipping market_open_check()"
+                )
+            else:
+                logger.info(
+                    "[startup_catchup] started after 11:00 ET on trading day — calling market_open_check()"
+                )
+                market_open_check()
         else:
             logger.info(
                 "[startup_catchup] market catch-up not needed (now=%s, window 11:00–%s)",
@@ -369,16 +393,34 @@ def startup_catchup() -> None:
             else:
                 n_days  = gap_days + 2
                 symbols = main._load_universe()
-                logger.info(
-                    "[startup_catchup] startup catch-up sync: DB last date=%s, "
-                    "last market close=%s, fetching %d days",
-                    max_date, last_close_date, n_days,
+
+                # Time-budget guard: skip sync if it would overlap market open
+                ok_to_sync = True
+                t_deadline = (
+                    datetime(now.year, now.month, now.day, 11, 0, tzinfo=config.TZ)
+                    - timedelta(minutes=config.SCHED_MIN_LEAD_MINS)
                 )
-                try:
-                    td_data.fetch_incremental(symbols, n_days=n_days)
-                    main.precompute_watchlist()
-                except Exception as exc:
-                    logger.warning("[startup_catchup] catch-up sync failed: %s", exc)
+                if now < t_deadline and symbols:
+                    n_batches = math.ceil(len(symbols) / config.TWELVEDATA_BATCH_SIZE)
+                    est_secs  = n_batches * (config.TWELVEDATA_BATCH_SIZE / config.TWELVEDATA_RATE_LIMIT_PER_MIN) * 60
+                    if est_secs > (t_deadline - now).total_seconds():
+                        logger.warning(
+                            "[startup_catchup] startup catch-up sync skipped — "
+                            "would overlap market open; nightly sync will catch up tonight"
+                        )
+                        ok_to_sync = False
+
+                if ok_to_sync:
+                    logger.info(
+                        "[startup_catchup] startup catch-up sync: DB last date=%s, "
+                        "last market close=%s, fetching %d days",
+                        max_date, last_close_date, n_days,
+                    )
+                    try:
+                        td_data.fetch_incremental(symbols, n_days=n_days)
+                        main.precompute_watchlist()
+                    except Exception as exc:
+                        logger.warning("[startup_catchup] catch-up sync failed: %s", exc)
         else:
             logger.debug("[startup_catchup] DB is current (last date=%s)", max_bar_date)
     else:
@@ -426,19 +468,27 @@ def _post_reconnect_catchup() -> None:
     min_lead = timedelta(minutes=config.SCHED_MIN_LEAD_MINS)
     same_day = now.date() == close_time.date()
 
-    # (fn, job_id, name, run_time, grace, worth_running)
+    # (fn, job_id, name, run_time, grace, worth_running, sequential)
+    # sequential=True: past-window jobs are called directly in order (fill then report)
+    # sequential=False: past-window jobs are re-scheduled via an immediate DateTrigger
     jobs = [
-        (job_signal_snap,         "signal_snap",         "IB snapshot + signal evaluation",    t_signal, 120, now < t_order),
-        (job_order_submission,    "order_submission",    "LOC/MOC order submission",            t_order,   60, now < t_fill),
-        (job_fill_reconciliation, "fill_reconciliation", "Fill confirmation + position update", t_fill,   300, same_day),
-        (job_daily_report,        "daily_report",        "Daily / weekly report",               t_report, 300, same_day),
+        (job_signal_snap,         "signal_snap",         "IB snapshot + signal evaluation",    t_signal, 120, now < t_order, False),
+        (job_order_submission,    "order_submission",    "LOC/MOC order submission",            t_order,   60, now < t_fill,  False),
+        (job_fill_reconciliation, "fill_reconciliation", "Fill confirmation + position update", t_fill,   300, same_day,      True),
+        (job_daily_report,        "daily_report",        "Daily / weekly report",               t_report, 300, same_day,      True),
     ]
 
-    for fn, job_id, name, run_time, grace, worth_running in jobs:
+    for fn, job_id, name, run_time, grace, worth_running, sequential in jobs:
         if not worth_running:
             logger.info(
                 "[watchdog] _post_reconnect_catchup: %s skipped — too late in sequence or not same day",
                 job_id,
+            )
+            continue
+
+        if _jobs_run_today.get(job_id) == now.date():
+            logger.debug(
+                "[watchdog] _post_reconnect_catchup: %s already ran today — skipping", job_id
             )
             continue
 
@@ -456,8 +506,15 @@ def _post_reconnect_catchup() -> None:
                 "[watchdog] _post_reconnect_catchup: %s scheduled at %s ET",
                 job_id, run_time.strftime("%H:%M"),
             )
+        elif sequential:
+            # Past-window sequential job — call directly so fill runs before report
+            logger.info(
+                "[watchdog] _post_reconnect_catchup: %s missed — calling directly",
+                job_id,
+            )
+            fn()
         else:
-            # Job time already passed — run immediately
+            # Past-window non-sequential job — re-schedule immediately
             immediate = now + timedelta(seconds=5)
             _scheduler.add_job(
                 fn,

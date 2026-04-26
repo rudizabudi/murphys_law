@@ -504,7 +504,7 @@ def order_submission() -> None:
 
     # Daily loss — unrealised intraday P&L across all open positions
     daily_pnl = sum(
-        (snap_prices.get(p["symbol"], p["fill_price"]) - p["fill_price"]) * p["shares"]
+        (snap_prices.get(p["symbol"], p["fill_price"]) - float(p["fill_price"])) * int(p["shares"])
         for p in open_positions
     )
     risk_engine.evaluate("daily_loss", {
@@ -558,9 +558,11 @@ def order_submission() -> None:
 
     # ── Build and submit entry orders (only if not halted) ────────────────────
     if not risk_engine.is_halted():
+        exiting_syms     = {o.symbol for o in exit_orders}
+        positions_post_exit = [p for p in open_positions if p["symbol"] not in exiting_syms]
         entry_orders = order_manager.build_entry_orders(
             entry_signals,
-            open_positions,
+            positions_post_exit,
             current_equity,
             snap_prices,
             exit_orders=exit_orders,
@@ -620,6 +622,7 @@ def fill_reconciliation() -> None:
     6. reconcile_with_ib() → risk_engine on mismatch (split symbols excluded).
     7. export_positions_json() if enabled.
     """
+    global _submitted
     logger.info("[main] fill_reconciliation: starting")
 
     order_ids = list(_submitted.keys())
@@ -837,6 +840,8 @@ def fill_reconciliation() -> None:
     # ── JSON export ───────────────────────────────────────────────────────────
     if config.EXPORT_STATE_JSON:
         portfolio_state.export_positions_json()
+
+    _submitted = {}
 
     logger.info("[main] fill_reconciliation: complete — %d open positions, deployed=%.1f%%",
                 len(positions_now), deployed_pct * 100)

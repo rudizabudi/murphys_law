@@ -755,14 +755,25 @@ def build_entry_orders(
 
 Note on deployed capital for the total notional gate: use **mark-to-market values** of open positions at the 15:40 snap price — not entry prices. This matches the backtest's `close_map` calculation and keeps leverage accurate.
 
-**Pending-exit notional credit** — when `exit_orders` is supplied, their notional (`quantity × snap_price`) is subtracted from the deployed total before the gate check.  Rationale: exits and entries fire at the same MOC session, so the exiting positions' capital is freed at auction close.  The gate becomes:
+**Pending-exit slot and notional accounting** — before calling `build_entry_orders()`, `order_submission()` filters `open_positions` to exclude symbols that have an exit order:
+
+```python
+exiting_syms        = {o.symbol for o in exit_orders}
+positions_post_exit = [p for p in open_positions if p["symbol"] not in exiting_syms]
+```
+
+`positions_post_exit` is passed as the `positions` argument so that both the slot counter (`slots_free = MAX_POSITIONS - len(positions)`) and the held-symbol filter correctly reflect the post-exit portfolio.  `exit_orders=exit_orders` is still forwarded separately so the notional credit is applied at the MTM gate.  The full gate logic becomes:
 
 ```
-effective_deployed = max(0, deployed_mtm − exit_credit)
+exit_credit        = sum(o.quantity × snap_price for o in exit_orders)
+deployed_mtm       = sum(p.shares × snap_price for p in positions_post_exit)
+effective_deployed = max(0, deployed_mtm − exit_credit)   # credit is 0 here since exiting
+                                                            # symbols are already excluded,
+                                                            # but guards against rounding
 (effective_deployed + new_notional) / equity ≤ MAX_TOTAL_NOTIONAL
 ```
 
-This prevents the bot from holding entry orders hostage to capital already earmarked for release.  `exit_orders=None` (default) leaves behaviour unchanged.
+This prevents the bot from treating exiting slots as occupied and holding entry orders hostage to capital already earmarked for release.  `exit_orders=None` (default) leaves behaviour unchanged.
 
 #### 4.6.3 Closing Auction Imbalance Filter (optional)
 
@@ -944,23 +955,39 @@ Called once at startup after the IB connection is established (before `build_sch
 
 3. **Nightly data catch-up** — Queries `MAX(date)` from `daily_bars`. Determines the last passed NYSE market close date using `pandas_market_calendars` (filters to sessions whose `market_close` UTC timestamp has already elapsed). If `MAX(date) < last_close_date`, computes `gap_days = (today − MAX(date)).days` and calls `td_data.fetch_incremental(symbols, n_days=gap_days + 2)` (the `+2` provides an overlap buffer). After the fetch, calls `main.precompute_watchlist()` so the watchlist reflects the freshly updated data. Logs: `"startup catch-up sync: DB last date=…, last market close=…, fetching N days"`. If `MAX(date)` already matches the last close, logs at DEBUG and skips.
 
+   **Time-budget guard** — Before starting the sync, estimates how long it will take using `ceil(len(symbols) / TWELVEDATA_BATCH_SIZE) × (TWELVEDATA_BATCH_SIZE / TWELVEDATA_RATE_LIMIT_PER_MIN) × 60` seconds and compares it against the time remaining until the market-open safety deadline (`11:00 ET − SCHED_MIN_LEAD_MINS`). If the estimate exceeds the available window, the sync is skipped with a WARNING: `"startup catch-up sync skipped — would overlap market open; nightly sync will catch up tonight"`. Execution continues without raising; data will be refreshed by tonight's `nightly_sync` job.
+
 #### Post-reconnect catch-up (`_post_reconnect_catchup()`)
 
 Called by `connection_watchdog()` immediately after each successful reconnect. Determines which intraday jobs were missed during the outage and re-registers them:
 
-- If a job's `run_time` is still `>= SCHED_MIN_LEAD_MINS` in the future → schedule at the natural `run_time` (same as `market_open_check` would).
-- If a job's `run_time` has already passed but it is still worth running → schedule immediately (`now + 5 s`).
+- If a job's `run_time` is still `>= SCHED_MIN_LEAD_MINS` in the future → schedule at the natural `run_time` (same as `market_open_check` would) via `_scheduler.add_job(DateTrigger(...))`.
+- If a job's `run_time` has already passed but it is still worth running:
+  - `signal_snap` / `order_submission` (non-sequential): re-schedule immediately via `_scheduler.add_job(DateTrigger(now + 5s))`.
+  - `fill_reconciliation` / `daily_report` (sequential): **called directly** (`fn()`) in order — fill first, then report — so they run synchronously within the watchdog cycle rather than as two concurrent near-simultaneous DateTrigger jobs. This guarantees the report always sees the reconciled position state.
 
 **Sequencing rules** (a job is worth running only if its successor has not already fired):
 
-| Job | Worth running if… |
-|---|---|
-| `signal_snap` | `now < t_order` (order_submission time has not passed) |
-| `order_submission` | `now < t_fill` (fill_reconciliation time has not passed) |
-| `fill_reconciliation` | same calendar day as `close_time` (before midnight ET) |
-| `daily_report` | same calendar day as `close_time` (before midnight ET) |
+| Job | Worth running if… | Past-window execution |
+|---|---|---|
+| `signal_snap` | `now < t_order` (order_submission time has not passed) | immediate DateTrigger |
+| `order_submission` | `now < t_fill` (fill_reconciliation time has not passed) | immediate DateTrigger |
+| `fill_reconciliation` | same calendar day as `close_time` (before midnight ET) | direct call |
+| `daily_report` | same calendar day as `close_time` (before midnight ET) | direct call |
 
 On a non-trading day the function returns immediately with no jobs scheduled.
+
+#### Intraday job completion tracker (`_jobs_run_today`)
+
+`_jobs_run_today: dict[str, date]` is a module-level dict that records the date each intraday job last completed successfully.  It provides an idempotency guarantee: each of the four market jobs runs **at most once per trading day** regardless of reconnects or `startup_catchup()` re-entries.
+
+**Recording:** each intraday job wrapper (`job_signal_snap`, `job_order_submission`, `job_fill_reconciliation`, `job_daily_report`) appends `_jobs_run_today[job_id] = date.today()` after its `main.*` call returns without raising.  An exception propagating out of the wrapper leaves the entry absent, so a subsequent reconnect-catchup may retry it.
+
+**Reset:** `_reset_daily_job_tracker()` clears the dict.  It is called at the start of `market_open_check()` (11:00 ET every trading day) so each new trading day starts with an empty tracker.
+
+**Check in `_post_reconnect_catchup()`:** before scheduling each job, the function checks `_jobs_run_today.get(job_id) == now.date()`.  If True, the job is skipped with a DEBUG log (`"job_id already ran today — skipping"`).  This prevents a reconnect that happens after fill_reconciliation or daily_report has already completed from scheduling a duplicate run.
+
+**Check in `startup_catchup()`:** before calling `market_open_check()`, the function checks whether `fill_reconciliation` or `daily_report` have already been recorded for today.  If either is present, the `market_open_check()` call is skipped (DEBUG log).  In practice this guard fires only when the scheduler process is warm-restarted mid-day after some jobs have already completed.
 
 #### Dynamically registered intraday jobs (DateTrigger, one-off)
 
@@ -996,6 +1023,7 @@ fill_reconciliation
     → append_equity_snapshot()
     → _reconcile_with_ib() against full live IB position list → alert on mismatch (split symbols excluded)
     → export_positions_json() if EXPORT_STATE_JSON=True
+    → _submitted = {}  (clear submitted dict to prevent re-processing on a second call)
 
 daily_report
     → build report from equity_log + trade_log

@@ -18,6 +18,7 @@ from apscheduler.triggers.date import DateTrigger
 from scheduler import (
     get_market_schedule, market_open_check, startup_catchup,
     connection_watchdog, _post_reconnect_catchup, _startup_halt_warning,
+    _reset_daily_job_tracker,
 )
 
 
@@ -701,25 +702,59 @@ class TestPostReconnectCatchup:
         assert "fill_reconciliation" in self._job_ids(calls)
         assert "daily_report"        in self._job_ids(calls)
 
+    def _run_tracking(self, monkeypatch, now):
+        """
+        Like _run(), but also patches job_fill_reconciliation and job_daily_report
+        to track direct (past-window sequential) calls.
+
+        Returns (add_job_calls, directly_called_ids) where directly_called_ids
+        is a list of job IDs whose functions were called directly (in call order).
+        """
+        mock_sched = MagicMock()
+        monkeypatch.setattr(sched_module, "_scheduler", mock_sched)
+        monkeypatch.setattr(
+            sched_module, "get_market_schedule",
+            lambda d=None: {"is_open": True, "close_time": self._CLOSE, "is_half_day": False},
+        )
+        monkeypatch.setattr(config, "SCHED_MIN_LEAD_MINS", 5)
+
+        call_order: list[str] = []
+        mock_fill   = MagicMock(side_effect=lambda: call_order.append("fill_reconciliation"))
+        mock_report = MagicMock(side_effect=lambda: call_order.append("daily_report"))
+        monkeypatch.setattr(sched_module, "job_fill_reconciliation", mock_fill)
+        monkeypatch.setattr(sched_module, "job_daily_report",        mock_report)
+
+        with patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            _post_reconnect_catchup()
+
+        return mock_sched.add_job.call_args_list, call_order
+
     def test_order_submission_skipped_when_fill_passed(self, monkeypatch):
-        """Reconnect at 16:12 (fill_reconciliation 16:10 passed) → signal & order skipped."""
-        now   = datetime(2024, 1, 2, 16, 12, tzinfo=config.TZ)
-        calls = self._run(monkeypatch, now)
+        """Reconnect at 16:12 (fill_reconciliation 16:10 passed) → signal & order skipped;
+        fill and report called directly (sequential)."""
+        now = datetime(2024, 1, 2, 16, 12, tzinfo=config.TZ)
+        calls, direct = self._run_tracking(monkeypatch, now)
         assert "signal_snap"         not in self._job_ids(calls)
         assert "order_submission"    not in self._job_ids(calls)
-        assert "fill_reconciliation" in self._job_ids(calls)
-        assert "daily_report"        in self._job_ids(calls)
+        assert "fill_reconciliation" in direct
+        assert "daily_report"        in direct
 
     def test_fill_and_report_run_immediately_when_missed_same_day(self, monkeypatch):
-        """Reconnect at 16:20 (both fill and report times passed) → both run immediately."""
-        now   = datetime(2024, 1, 2, 16, 20, tzinfo=config.TZ)
-        calls = self._run(monkeypatch, now)
-        ids = self._job_ids(calls)
-        assert "fill_reconciliation" in ids
-        assert "daily_report"        in ids
-        imm = self._immediate_ids(calls)
-        assert "fill_reconciliation" in imm
-        assert "daily_report"        in imm
+        """Reconnect at 16:20 (both fill and report times passed) → both called directly."""
+        now = datetime(2024, 1, 2, 16, 20, tzinfo=config.TZ)
+        calls, direct = self._run_tracking(monkeypatch, now)
+        assert "fill_reconciliation" in direct
+        assert "daily_report"        in direct
+        assert "fill_reconciliation" not in self._job_ids(calls)
+        assert "daily_report"        not in self._job_ids(calls)
+
+    def test_fill_called_before_report_when_both_missed(self, monkeypatch):
+        """When both fill and report are past their window, fill runs before report."""
+        now = datetime(2024, 1, 2, 16, 20, tzinfo=config.TZ)
+        _calls, direct = self._run_tracking(monkeypatch, now)
+        assert direct.index("fill_reconciliation") < direct.index("daily_report")
 
     def test_nothing_scheduled_on_non_trading_day(self, monkeypatch):
         """Non-trading day → _post_reconnect_catchup schedules nothing."""
@@ -978,3 +1013,185 @@ class TestStartupCatchupDataSync:
                 startup_catchup()
 
         mock_fetch.assert_not_called()
+
+    def test_sync_skipped_when_would_overlap_market_open(self, monkeypatch):
+        """
+        Startup at 10:50 with 500 symbols — estimated sync time far exceeds the
+        5-min window to the 10:55 deadline (11:00 − 5 min lead) → fetch skipped.
+        """
+        last_close_et = datetime(2024, 1, 5, 16, 0, tzinfo=config.TZ)
+        max_bar_date  = "2024-01-02"
+        now           = datetime(2024, 1, 8, 10, 50, tzinfo=config.TZ)  # 5 min to deadline
+
+        mock_fetch = MagicMock()
+        mock_main  = MagicMock()
+        mock_main.sunday_universe_update = MagicMock()
+        mock_main._load_universe.return_value = ["SYM"] * 500  # ceil(500/8)=63 batches → 3780s
+
+        monkeypatch.setattr(config, "TWELVEDATA_BATCH_SIZE",        8)
+        monkeypatch.setattr(config, "TWELVEDATA_RATE_LIMIT_PER_MIN", 8)
+        monkeypatch.setattr(config, "SCHED_MIN_LEAD_MINS",           5)
+        monkeypatch.setattr(sched_module, "_nyse", self._make_nyse_mock(last_close_et))
+        monkeypatch.setattr(sched_module, "get_market_schedule",
+                            lambda d=None: {"is_open": False, "close_time": None, "is_half_day": False})
+        monkeypatch.setattr(sched_module, "td_data", MagicMock(fetch_incremental=mock_fetch))
+        monkeypatch.setattr(sched_module, "main", mock_main)
+
+        with db.connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS daily_bars "
+                "(symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)"
+            )
+            conn.execute("INSERT INTO daily_bars VALUES (?,?,?,?,?,?,?)",
+                         ("AAPL", max_bar_date, 100, 110, 90, 105, 1000000))
+
+        with patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            with patch("scheduler.market_open_check"):
+                startup_catchup()
+
+        mock_fetch.assert_not_called()
+
+    def test_sync_proceeds_when_ample_time_before_market_open(self, monkeypatch):
+        """
+        Startup at 05:00 with 2 symbols — 1 batch → 60s estimate, well within
+        the ~6-hour window to the deadline → fetch proceeds normally.
+        """
+        last_close_et = datetime(2024, 1, 5, 16, 0, tzinfo=config.TZ)
+        max_bar_date  = "2024-01-02"
+        now           = datetime(2024, 1, 8, 5, 0, tzinfo=config.TZ)  # 6 h before deadline
+
+        mock_fetch = MagicMock(return_value=10)
+        mock_main  = MagicMock()
+        mock_main.sunday_universe_update = MagicMock()
+        mock_main._load_universe.return_value = ["AAPL", "MSFT"]  # 1 batch → 60s
+
+        monkeypatch.setattr(config, "TWELVEDATA_BATCH_SIZE",        8)
+        monkeypatch.setattr(config, "TWELVEDATA_RATE_LIMIT_PER_MIN", 8)
+        monkeypatch.setattr(config, "SCHED_MIN_LEAD_MINS",           5)
+        monkeypatch.setattr(sched_module, "_nyse", self._make_nyse_mock(last_close_et))
+        monkeypatch.setattr(sched_module, "get_market_schedule",
+                            lambda d=None: {"is_open": False, "close_time": None, "is_half_day": False})
+        monkeypatch.setattr(sched_module, "td_data", MagicMock(fetch_incremental=mock_fetch))
+        monkeypatch.setattr(sched_module, "main", mock_main)
+
+        with db.connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS daily_bars "
+                "(symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)"
+            )
+            conn.execute("INSERT INTO daily_bars VALUES (?,?,?,?,?,?,?)",
+                         ("AAPL", max_bar_date, 100, 110, 90, 105, 1000000))
+
+        with patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            with patch("scheduler.market_open_check"):
+                startup_catchup()
+
+        mock_fetch.assert_called_once()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestJobTracker — _jobs_run_today idempotency
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestJobTracker:
+    """
+    Tests for _jobs_run_today completion tracking:
+      - _reset_daily_job_tracker() clears the dict
+      - _post_reconnect_catchup() skips a job whose job_id is already in the tracker
+      - _post_reconnect_catchup() schedules a job whose job_id is absent from the tracker
+    """
+
+    # Normal trading day used in all sub-tests — close 16:00 ET on 2024-01-02
+    _CLOSE = datetime(2024, 1, 2, 16, 0, tzinfo=config.TZ)
+    _TODAY = date(2024, 1, 2)
+
+    @pytest.fixture(autouse=True)
+    def reset_tracker(self):
+        """Ensure _jobs_run_today is empty before and after every test."""
+        sched_module._jobs_run_today.clear()
+        yield
+        sched_module._jobs_run_today.clear()
+
+    def _run_catchup(self, monkeypatch, now):
+        """
+        Call _post_reconnect_catchup() with a fixed schedule.
+
+        Patches job_fill_reconciliation and job_daily_report to prevent real
+        execution when they are called directly (past-window sequential path).
+
+        Returns (add_job_calls, directly_called_ids) where directly_called_ids
+        is a list of job IDs called directly in call order.
+        """
+        mock_sched  = MagicMock()
+        direct_ids: list[str] = []
+        mock_fill   = MagicMock(side_effect=lambda: direct_ids.append("fill_reconciliation"))
+        mock_report = MagicMock(side_effect=lambda: direct_ids.append("daily_report"))
+        monkeypatch.setattr(sched_module, "_scheduler",              mock_sched)
+        monkeypatch.setattr(sched_module, "job_fill_reconciliation", mock_fill)
+        monkeypatch.setattr(sched_module, "job_daily_report",        mock_report)
+        monkeypatch.setattr(
+            sched_module, "get_market_schedule",
+            lambda d=None: {"is_open": True, "close_time": self._CLOSE, "is_half_day": False},
+        )
+        monkeypatch.setattr(config, "SCHED_MIN_LEAD_MINS", 5)
+        with patch("scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            _post_reconnect_catchup()
+        return mock_sched.add_job.call_args_list, direct_ids
+
+    def test_reset_clears_all_entries(self):
+        """_reset_daily_job_tracker() empties _jobs_run_today regardless of prior content."""
+        sched_module._jobs_run_today["fill_reconciliation"] = self._TODAY
+        sched_module._jobs_run_today["daily_report"]        = self._TODAY
+        _reset_daily_job_tracker()
+        assert sched_module._jobs_run_today == {}
+
+    def test_post_reconnect_skips_fill_when_already_run_today(self, monkeypatch):
+        """
+        fill_reconciliation recorded in tracker → _post_reconnect_catchup must not
+        call it even though it is still the same trading day.
+
+        Reconnect at 16:12 (fill_reconciliation at 16:10 has passed, same day).
+        Without the tracker, fill_reconciliation would be called directly.
+        With the tracker entry, it must be skipped entirely.
+        """
+        now = datetime(2024, 1, 2, 16, 12, tzinfo=config.TZ)
+        sched_module._jobs_run_today["fill_reconciliation"] = self._TODAY
+
+        calls, direct_ids = self._run_catchup(monkeypatch, now)
+        scheduled_ids = {c[1]["id"] for c in calls}
+        assert "fill_reconciliation" not in scheduled_ids
+        assert "fill_reconciliation" not in direct_ids
+
+    def test_post_reconnect_runs_fill_when_not_yet_run_today(self, monkeypatch):
+        """
+        fill_reconciliation absent from tracker → _post_reconnect_catchup must call it directly.
+
+        Same scenario (reconnect at 16:12, same trading day) but tracker is empty.
+        fill_reconciliation is past its window so it is called directly, not scheduled.
+        """
+        now = datetime(2024, 1, 2, 16, 12, tzinfo=config.TZ)
+        # tracker is empty (autouse fixture ensures this)
+
+        calls, direct_ids = self._run_catchup(monkeypatch, now)
+        assert "fill_reconciliation" in direct_ids
+
+    def test_post_reconnect_skips_only_already_run_jobs(self, monkeypatch):
+        """
+        Partial tracker: fill_reconciliation ran, daily_report did not.
+        fill_reconciliation must be skipped; daily_report must be called directly.
+        """
+        now = datetime(2024, 1, 2, 16, 20, tzinfo=config.TZ)
+        sched_module._jobs_run_today["fill_reconciliation"] = self._TODAY
+        # daily_report not in tracker
+
+        calls, direct_ids = self._run_catchup(monkeypatch, now)
+        scheduled_ids = {c[1]["id"] for c in calls}
+        assert "fill_reconciliation" not in scheduled_ids
+        assert "fill_reconciliation" not in direct_ids
+        assert "daily_report"        in direct_ids

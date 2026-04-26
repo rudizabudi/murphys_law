@@ -119,12 +119,13 @@ class TestOrderSubmissionRejection:
     everything else in order_submission() via monkeypatching.
     """
 
-    def _build_snap_state(self, entry_signals=None, exit_signals=None, snap_prices=None):
+    def _build_snap_state(self, entry_signals=None, exit_signals=None,
+                          snap_prices=None, open_positions=None):
         return {
-            "entry_signals":  entry_signals or [],
-            "exit_signals":   exit_signals  or [],
-            "snap_prices":    snap_prices   or {},
-            "open_positions": [],
+            "entry_signals":  entry_signals  or [],
+            "exit_signals":   exit_signals   or [],
+            "snap_prices":    snap_prices    or {},
+            "open_positions": open_positions or [],
             "account":        {"net_liquidation": 100_000.0},
             "snap_date":      "2024-01-02",
         }
@@ -246,6 +247,79 @@ class TestOrderSubmissionRejection:
         main.order_submission()
 
         assert "TSLA" in submitted_syms
+
+    def test_build_entry_orders_receives_exit_orders(self, monkeypatch):
+        """
+        build_entry_orders must be called with exit_orders= so the pending-exit
+        notional credit is applied to the total-notional gate.
+        """
+        exit_order = Order(
+            symbol="HELD", action="SELL", order_type="MOC",
+            quantity=50, limit_price=None, reason="exit", pos_id="P1",
+        )
+        import order_manager
+        monkeypatch.setattr(order_manager, "build_exit_orders", MagicMock(return_value=[exit_order]))
+        monkeypatch.setattr(main, "submit_order", MagicMock(return_value=99))
+
+        main._snap_state = self._build_snap_state()
+        main.order_submission()
+
+        self.mock_build_entry.assert_called_once()
+        _, kwargs = self.mock_build_entry.call_args
+        assert "exit_orders" in kwargs
+        assert kwargs["exit_orders"] == [exit_order]
+
+    def test_positions_post_exit_excludes_exiting_symbols(self, monkeypatch):
+        """
+        With 13 open positions and 4 exit orders, build_entry_orders must receive
+        a positions list of length 9, not 13 — so both the slot counter and the
+        notional gate use the post-exit portfolio view.
+
+        MAX_POSITIONS=15 and 9 positions remaining → 6 free slots, meaning up to
+        6 entry orders can be built (subject to other gates).
+        """
+        # 13 open positions: P0..P12
+        open_positions = [
+            {"symbol": f"SYM{i}", "shares": 100, "fill_price": 50.0}
+            for i in range(13)
+        ]
+        # 4 of them are exiting: SYM0..SYM3
+        exit_orders_list = [
+            Order(
+                symbol=f"SYM{i}", action="SELL", order_type="MOC",
+                quantity=100, limit_price=None, reason="exit", pos_id=f"P{i}",
+            )
+            for i in range(4)
+        ]
+
+        import order_manager, config
+        monkeypatch.setattr(order_manager, "build_exit_orders",
+                            MagicMock(return_value=exit_orders_list))
+        monkeypatch.setattr(main, "submit_order", MagicMock(return_value=99))
+        monkeypatch.setattr(config, "MAX_POSITIONS", 15)
+
+        captured_positions: list[list] = []
+        def _capture_positions(signals, positions, equity, prices, **kw):
+            captured_positions.append(positions)
+            return []
+        monkeypatch.setattr(order_manager, "build_entry_orders", _capture_positions)
+
+        main._snap_state = self._build_snap_state(
+            open_positions=open_positions,
+            snap_prices={f"SYM{i}": 50.0 for i in range(13)},
+        )
+        main.order_submission()
+
+        assert len(captured_positions) == 1
+        positions_received = captured_positions[0]
+        # 13 open - 4 exiting = 9 remaining
+        assert len(positions_received) == 9
+        received_syms = {p["symbol"] for p in positions_received}
+        for i in range(4):
+            assert f"SYM{i}" not in received_syms, f"SYM{i} should be excluded (has exit order)"
+        # 15 - 9 = 6 free slots — verify none of the exiting symbols leaked through
+        for i in range(4, 13):
+            assert f"SYM{i}" in received_syms
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1054,3 +1128,74 @@ class TestWeeklyReport:
         monkeypatch.setattr(config, "REPORT_WEEKLY", False)
         self._run_on_friday(monkeypatch)
         self.mock_build_weekly.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestFillReconciliationSubmittedClear
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFillReconciliationSubmittedClear:
+    """fill_reconciliation() clears _submitted on completion."""
+
+    @pytest.fixture(autouse=True)
+    def fresh_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "DB_DRIVER", "sqlite")
+        monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
+        db.init_db()
+
+    @pytest.fixture(autouse=True)
+    def patch_ib(self, monkeypatch):
+        monkeypatch.setattr(main, "bridge",            MagicMock())
+        monkeypatch.setattr(main, "get_filled_orders", MagicMock(return_value={}))
+        monkeypatch.setattr(main, "get_ib_positions",  MagicMock(return_value=[]))
+        monkeypatch.setattr(main, "detect_splits",     MagicMock(return_value=[]))
+
+    @pytest.fixture(autouse=True)
+    def patch_portfolio(self, monkeypatch):
+        self.mock_save  = MagicMock()
+        self.mock_close = MagicMock()
+        monkeypatch.setattr(portfolio_state, "save_position",          self.mock_save)
+        monkeypatch.setattr(portfolio_state, "close_position",         self.mock_close)
+        monkeypatch.setattr(portfolio_state, "load_positions",         MagicMock(return_value=[]))
+        monkeypatch.setattr(portfolio_state, "get_open_equity",        MagicMock(return_value=0.0))
+        monkeypatch.setattr(portfolio_state, "append_equity_snapshot", MagicMock())
+
+    @pytest.fixture(autouse=True)
+    def patch_misc(self, monkeypatch):
+        monkeypatch.setattr(config, "EXPORT_STATE_JSON", False)
+        monkeypatch.setattr(risk_engine, "evaluate", lambda *a, **kw: True)
+
+    @pytest.fixture(autouse=True)
+    def reset_state(self):
+        main._snap_state = {
+            "entry_signals": [], "snap_prices": {},
+            "open_positions": [], "account": {"net_liquidation": 100_000.0},
+        }
+        yield
+        main._submitted  = {}
+        main._snap_state = {}
+
+    def test_submitted_cleared_after_fill_reconciliation(self):
+        """fill_reconciliation() clears _submitted dict on completion."""
+        main._submitted = {
+            101: {"symbol": "AAPL", "action": "BUY", "pos_id": "", "shares": 10,
+                  "fill_price": 150.0, "reason": "entry", "order_type": "MOC", "limit_price": None}
+        }
+        assert main._submitted  # non-empty before
+        main.fill_reconciliation()
+        assert main._submitted == {}
+
+    def test_second_call_processes_no_fills(self):
+        """After _submitted is cleared, a second call processes no fills."""
+        main._submitted = {
+            101: {"symbol": "AAPL", "action": "BUY", "pos_id": "", "shares": 10,
+                  "fill_price": 150.0, "reason": "entry", "order_type": "MOC", "limit_price": None}
+        }
+        main.fill_reconciliation()
+        assert main._submitted == {}
+
+        save_before  = self.mock_save.call_count
+        close_before = self.mock_close.call_count
+        main.fill_reconciliation()
+        assert self.mock_save.call_count  == save_before
+        assert self.mock_close.call_count == close_before
