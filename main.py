@@ -771,12 +771,18 @@ def fill_reconciliation() -> None:
     # ── Persist updated bars_held / consec_lows for still-open positions ─────
     # get_exit_signals() in signal_snap() mutates bars_held/consec_lows in-place
     # on the snap-state open positions but never writes those values back to DB.
-    # Save every position that was NOT exited this run so the counters survive
-    # across reconciliation cycles.
+    # Use an explicit UPDATE (not save_position) so only these two counters are
+    # touched — save_position intentionally excludes bars_held from its update path.
     snap_open = _snap_state.get("open_positions", [])
+    _ph       = db.ph()
     for sp in snap_open:
         if sp.get("symbol") not in exited_today:
-            portfolio_state.save_position(sp)
+            with db.connect() as conn:
+                conn.execute(
+                    f"UPDATE positions SET bars_held={_ph}, consec_lows={_ph} "
+                    f"WHERE pos_id={_ph}",
+                    (sp.get("bars_held", 0), sp.get("consec_lows", 0), sp.get("pos_id")),
+                )
 
     # ── Equity snapshot ───────────────────────────────────────────────────────
     # Reload positions to capture all saves/closes performed above.

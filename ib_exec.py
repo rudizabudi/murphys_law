@@ -44,6 +44,7 @@ from ibapi.order import Order as IBOrder
 from ibapi.wrapper import EWrapper
 
 import config
+import db
 
 logger = logging.getLogger("murphy")
 
@@ -307,7 +308,14 @@ class IBBridge(EWrapper, EClient):
         self._thread = threading.Thread(target=self.run, daemon=True, name="ib-run")
         self._thread.start()
         # Block until IB acknowledges the connection
-        self._next_order_id = self._order_id_q.get(timeout=_DEFAULT_TIMEOUT)
+        ib_next_id = self._order_id_q.get(timeout=_DEFAULT_TIMEOUT)
+        try:
+            last_id_str = db.get_system_state("last_order_id")
+            if last_id_str is not None:
+                ib_next_id = max(ib_next_id, int(last_id_str) + 1)
+        except Exception:
+            pass
+        self._next_order_id = ib_next_id
         logger.info("[ib] Connected to %s:%d. Next order id: %d",
                     config.IB_HOST, config.IB_PORT, self._next_order_id)
 
@@ -335,10 +343,14 @@ class IBBridge(EWrapper, EClient):
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def get_next_order_id(self) -> int:
-        """Return the current next-valid order ID and increment the local counter."""
+        """Return the current next-valid order ID, increment the local counter, and persist."""
         with self._order_id_lock:
             oid = self._next_order_id
             self._next_order_id += 1
+        try:
+            db.set_system_state("last_order_id", str(oid))
+        except Exception:
+            pass
         return oid
 
     def heartbeat(self) -> bool:

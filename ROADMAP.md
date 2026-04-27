@@ -825,6 +825,8 @@ class IBBridge:
 
 **Disconnect event mechanism:** `IBBridge._disconnect_event` is a `threading.Event` initialised in `__init__`. The `connectionClosed()` EWrapper callback (fired by ibapi when the TCP connection is lost) calls `_disconnect_event.set()`. `wait_for_disconnect()` blocks on this event; `clear_disconnect()` resets it.
 
+**Persistent order ID across sessions:** After `nextValidId` fires, `connect()` reads `last_order_id` from the `system_state` table and takes `max(ib_next_id, last_order_id + 1)` as the session starting ID. This prevents order ID reuse when IB's counter resets below the highest ID dispensed in a prior session (e.g. after a Gateway restart). `get_next_order_id()` writes the dispensed ID back to `system_state` on every call. Both operations are wrapped in `try/except` so a missing or unavailable DB does not interrupt order flow — the IB-provided ID is used as fallback.
+
 **`connect()` cleanup on reconnect:** Before opening a new socket, `connect()` always:
 1. Calls `_disconnect_event.clear()` so the watchdog cannot trip on a stale event from the previous session.
 2. Checks `self._thread.is_alive()`. If the old run-thread is still live, calls `EClient.disconnect(self)` to close the socket, then `self._thread.join(timeout=5)` to wait for it to exit.

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 import config
+import db
 import ib_exec
 import ib_exec
 from ib_exec import (
@@ -189,6 +190,11 @@ class TestIBCController:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestIBBridgeConnect:
+
+    @pytest.fixture(autouse=True)
+    def fresh_db(self, tmp_path, monkeypatch):
+        """Redirect DB to a temp path so last_order_id never bleeds in from the live DB."""
+        monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
 
     def test_connect_starts_daemon_thread(self):
         """connect() must start exactly one daemon thread named 'ib-run'."""
@@ -757,3 +763,69 @@ class TestOrderRejection:
                 submit_order(bridge, order)
 
         assert len(ib_exec._order_errors) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestOrderIdPersistence
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestOrderIdPersistence:
+
+    @pytest.fixture(autouse=True)
+    def fresh_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
+        db.init_db()
+
+    def test_nextValidId_lower_than_last_uses_last_plus_one(self):
+        """When IB's nextValidId < last_order_id, start at last_order_id + 1."""
+        db.set_system_state("last_order_id", "100")
+        bridge = IBBridge()
+
+        def fake_run():
+            bridge.nextValidId(50)
+
+        with patch("ibapi.client.EClient.connect"):
+            with patch("ibapi.client.EClient.run", side_effect=fake_run):
+                bridge.connect()
+
+        assert bridge._next_order_id == 101
+
+    def test_nextValidId_higher_than_last_uses_ib_value(self):
+        """When IB's nextValidId > last_order_id, use the IB-provided value."""
+        db.set_system_state("last_order_id", "100")
+        bridge = IBBridge()
+
+        def fake_run():
+            bridge.nextValidId(150)
+
+        with patch("ibapi.client.EClient.connect"):
+            with patch("ibapi.client.EClient.run", side_effect=fake_run):
+                bridge.connect()
+
+        assert bridge._next_order_id == 150
+
+    def test_get_next_order_id_persists_each_call(self):
+        """Each get_next_order_id() call writes the dispensed ID to system_state."""
+        bridge = _make_bridge_stub()
+        bridge._next_order_id = 200
+
+        oid1 = bridge.get_next_order_id()
+        assert oid1 == 200
+        assert db.get_system_state("last_order_id") == "200"
+
+        oid2 = bridge.get_next_order_id()
+        assert oid2 == 201
+        assert db.get_system_state("last_order_id") == "201"
+
+    def test_fresh_session_no_system_state_uses_ib_id(self):
+        """With no last_order_id entry in DB, fall back to the IB-provided ID."""
+        bridge = IBBridge()
+
+        def fake_run():
+            bridge.nextValidId(42)
+
+        with patch("ibapi.client.EClient.connect"):
+            with patch("ibapi.client.EClient.run", side_effect=fake_run):
+                bridge.connect()
+
+        assert bridge._next_order_id == 42

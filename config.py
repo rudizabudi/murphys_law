@@ -54,7 +54,7 @@ IB_CLIENT_ID              = 1001
 IB_SUBACCOUNT             = ""          # Subaccount ID (e.g. "DU1234567"); empty = use master account
 IB_HEARTBEAT_TIMEOUT_SEC  = 5           # seconds to wait for reqCurrentTime response
 IB_RECONNECT_INTERVAL_SEC = 30          # seconds between reconnect attempts in connection_watchdog
-IB_RECONNECT_ALERT_AFTER  = 10         # send warning alert after this many failed reconnect attempts
+IB_RECONNECT_ALERT_AFTER  = 10          # send warning alert after this many failed reconnect attempts
 IB_SOFT_ERROR_CODES       = [300, 1100, 2103, 2104, 2105, 2106, 2107, 2108, 2157, 2158, 10268, 10349]   # informational; not logged as errors
 IB_REJECTION_CODES        = [201, 202, 203, 321, 322]         # hard order rejections
 

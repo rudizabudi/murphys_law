@@ -47,6 +47,11 @@ _POS_COLUMNS = (
     "ibs_at_entry",
 )
 
+# Fields that may be updated on an existing position via save_position().
+# bars_held, consec_lows, and created_at are intentionally excluded — they are
+# managed by explicit targeted UPDATEs so they are never accidentally reset.
+_METADATA_COLS = ("ib_order_id", "order_type", "limit_price", "qpi_at_entry", "ibs_at_entry")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Read
@@ -76,6 +81,12 @@ def load_positions() -> list[dict]:
 def save_position(pos: dict) -> None:
     """
     Upsert a position dict into the positions table.
+
+    New positions: all supplied columns are inserted.
+    Existing positions: only _METADATA_COLS are updated. bars_held, consec_lows,
+    and created_at are never overwritten — use an explicit
+    ``UPDATE positions SET bars_held=?, consec_lows=? WHERE pos_id=?`` for those.
+
     pos must contain at minimum: pos_id, symbol, direction, entry_date,
     fill_price, shares, notional.
     """
@@ -85,23 +96,38 @@ def save_position(pos: dict) -> None:
     cols   = [c for c in _POS_COLUMNS if c in pos]
     values = [pos[c] for c in cols]
 
+    upd_cols   = [c for c in _METADATA_COLS if c in pos]
+    upd_values = [pos[c] for c in upd_cols] + ([pos["pos_id"]] if upd_cols else [])
+
     if config.DB_DRIVER == "sqlite":
         placeholders = ", ".join(p for _ in cols)
-        sql = (
-            f"INSERT OR REPLACE INTO positions ({', '.join(cols)}) "
+        insert_sql = (
+            f"INSERT OR IGNORE INTO positions ({', '.join(cols)}) "
             f"VALUES ({placeholders})"
         )
+        update_sql = (
+            f"UPDATE positions "
+            f"SET {', '.join(f'{c}={p}' for c in upd_cols)} "
+            f"WHERE pos_id={p}"
+        ) if upd_cols else None
+        with db.connect() as conn:
+            conn.execute(insert_sql, values)
+            if update_sql:
+                conn.execute(update_sql, upd_values)
     else:
         placeholders = ", ".join(p for _ in cols)
-        updates = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c != "pos_id")
+        if upd_cols:
+            updates     = ", ".join(f"{c}=EXCLUDED.{c}" for c in upd_cols)
+            on_conflict = f"DO UPDATE SET {updates}"
+        else:
+            on_conflict = "DO NOTHING"
         sql = (
             f"INSERT INTO positions ({', '.join(cols)}) "
             f"VALUES ({placeholders}) "
-            f"ON CONFLICT (pos_id) DO UPDATE SET {updates}"
+            f"ON CONFLICT (pos_id) {on_conflict}"
         )
-
-    with db.connect() as conn:
-        conn.execute(sql, values)
+        with db.connect() as conn:
+            conn.execute(sql, values)
 
     logger.debug("[portfolio] save_position %s", pos.get("pos_id"))
 

@@ -166,16 +166,27 @@ _TABLES = [
         created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """,
+    # Key-value store for cross-session state (last_order_id, last_universe_update, etc.)
+    """
+    CREATE TABLE IF NOT EXISTS system_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
 ]
 
 
 # Additive migrations — each is a no-op if the column already exists.
 # Catching the exception is necessary for SQLite < 3.37 (no ADD COLUMN IF NOT EXISTS).
+# Data-fix UPDATEs are guarded by the condition they target so they are idempotent.
 _MIGRATIONS = [
     "ALTER TABLE positions ADD COLUMN order_type   TEXT",
     "ALTER TABLE positions ADD COLUMN limit_price  REAL",
     "ALTER TABLE positions ADD COLUMN qpi_at_entry REAL",
     "ALTER TABLE positions ADD COLUMN ibs_at_entry REAL",
+    # April 9 → April 28 = 13 trading days; bars_held was incorrectly frozen at 9
+    "UPDATE positions SET bars_held=13 WHERE pos_id='XOM_2026-04-09' AND bars_held=9",
+    "UPDATE positions SET bars_held=13 WHERE pos_id='GD_2026-04-09'  AND bars_held=9",
 ]
 
 
@@ -194,6 +205,7 @@ def init_db() -> None:
                 cur.execute(stmt)
             except Exception:
                 pass  # column already exists
+        print("Migrations done.")
         conn.commit()
     finally:
         conn.close()
@@ -238,3 +250,34 @@ def upsert_daily_bars(rows: list[dict]) -> int:
         conn.executemany(sql, params)
 
     return len(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYSTEM STATE  (key-value store)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_system_state(key: str) -> str | None:
+    """Return the stored value for *key*, or None if absent or on any error."""
+    p = ph()
+    try:
+        with connect() as conn:
+            row = conn.execute(
+                f"SELECT value FROM system_state WHERE key = {p}", (key,)
+            ).fetchone()
+        return dict(row)["value"] if row else None
+    except Exception:
+        return None
+
+
+def set_system_state(key: str, value: str) -> None:
+    """Upsert a key-value pair in system_state."""
+    p = ph()
+    if config.DB_DRIVER == "sqlite":
+        sql = f"INSERT OR REPLACE INTO system_state (key, value) VALUES ({p}, {p})"
+    else:
+        sql = (
+            f"INSERT INTO system_state (key, value) VALUES ({p}, {p}) "
+            f"ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value"
+        )
+    with connect() as conn:
+        conn.execute(sql, (key, value))

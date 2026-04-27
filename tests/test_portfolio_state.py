@@ -132,11 +132,38 @@ class TestSavePosition:
         assert rows[0]["fill_price"] == 100.0
 
     def test_upsert_updates_existing(self):
-        portfolio_state.save_position(_make_pos(pos_id="P1", bars_held=0))
-        portfolio_state.save_position(_make_pos(pos_id="P1", bars_held=5))
+        """save_position() on an existing row updates metadata fields (single row remains)."""
+        portfolio_state.save_position(_make_pos(pos_id="P1", order_type=None))
+        portfolio_state.save_position(_make_pos(pos_id="P1", order_type="LOC"))
         rows = portfolio_state.load_positions()
         assert len(rows) == 1
-        assert rows[0]["bars_held"] == 5
+        assert rows[0]["order_type"] == "LOC"
+
+    def test_save_position_preserves_bars_held_on_existing(self):
+        """save_position() on an existing row must NOT overwrite bars_held."""
+        portfolio_state.save_position(_make_pos(pos_id="P1", bars_held=0))
+        # Simulate a counter increment via the explicit UPDATE path
+        with db.connect() as conn:
+            conn.execute("UPDATE positions SET bars_held=7 WHERE pos_id='P1'")
+        # A subsequent save_position call (e.g. metadata refresh) must not reset it
+        portfolio_state.save_position(_make_pos(pos_id="P1", bars_held=0))
+        rows = portfolio_state.load_positions()
+        assert rows[0]["bars_held"] == 7
+
+    def test_save_position_preserves_consec_lows_on_existing(self):
+        """save_position() on an existing row must NOT overwrite consec_lows."""
+        portfolio_state.save_position(_make_pos(pos_id="P1", consec_lows=0))
+        with db.connect() as conn:
+            conn.execute("UPDATE positions SET consec_lows=4 WHERE pos_id='P1'")
+        portfolio_state.save_position(_make_pos(pos_id="P1", consec_lows=0))
+        rows = portfolio_state.load_positions()
+        assert rows[0]["consec_lows"] == 4
+
+    def test_new_position_bars_held_zero(self):
+        """A freshly inserted position gets bars_held=0 from the dict."""
+        portfolio_state.save_position(_make_pos(pos_id="P1", bars_held=0))
+        rows = portfolio_state.load_positions()
+        assert rows[0]["bars_held"] == 0
 
     def test_bars_held_default(self):
         pos = _make_pos()
@@ -193,7 +220,8 @@ class TestEntryMetadataColumns:
         assert row["ibs_at_entry"]  is None
 
     def test_upsert_preserves_entry_metadata(self):
-        """A subsequent save_position() call (e.g. bars_held update) must not wipe the entry columns."""
+        """save_position() on an existing row preserves entry metadata; bars_held is NOT
+        overwritten even when it appears in the dict with a different value."""
         pos = _make_pos(
             order_type="LOC",
             limit_price=200.0,
@@ -202,13 +230,12 @@ class TestEntryMetadataColumns:
         )
         portfolio_state.save_position(pos)
 
-        # Simulate a daily bars_held increment that also carries the metadata
-        pos2 = {**pos, "bars_held": 3}
-        portfolio_state.save_position(pos2)
+        # Second call with bars_held=99 — must NOT reset bars_held; metadata must survive
+        portfolio_state.save_position({**pos, "bars_held": 99})
 
         row = portfolio_state.load_positions()[0]
-        assert row["bars_held"]     == 3
-        assert row["order_type"]    == "LOC"
+        assert row["bars_held"]    == 0      # NOT 99 — bars_held excluded from upsert UPDATE
+        assert row["order_type"]   == "LOC"
         assert abs(row["limit_price"]  - 200.0) < 1e-9
         assert abs(row["qpi_at_entry"] - 0.05)  < 1e-9
         assert abs(row["ibs_at_entry"] - 0.10)  < 1e-9
@@ -485,3 +512,48 @@ class TestExportPositionsJson:
         with open(dest) as fh:
             data = json.load(fh)
         assert data == []  # position was closed, so list is empty
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestBarsIncrementUpdate
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBarsIncrementUpdate:
+    """
+    Verify the explicit UPDATE positions SET bars_held=?, consec_lows=? pattern
+    used by fill_reconciliation() to persist the in-memory counter increments.
+    """
+
+    def _update_bars(self, pos_id: str, bars_held: int, consec_lows: int) -> None:
+        """Run the same UPDATE statement used in fill_reconciliation()."""
+        p = db.ph()
+        with db.connect() as conn:
+            conn.execute(
+                f"UPDATE positions SET bars_held={p}, consec_lows={p} WHERE pos_id={p}",
+                (bars_held, consec_lows, pos_id),
+            )
+
+    def test_bars_held_updated_correctly(self):
+        """UPDATE sets bars_held to the supplied value."""
+        portfolio_state.save_position(_make_pos(pos_id="P1", bars_held=2, consec_lows=1))
+        self._update_bars("P1", bars_held=5, consec_lows=2)
+        row = portfolio_state.load_positions()[0]
+        assert row["bars_held"]   == 5
+        assert row["consec_lows"] == 2
+
+    def test_only_bars_and_consec_changed(self):
+        """UPDATE must not alter fill_price, order_type, or other fields."""
+        portfolio_state.save_position(_make_pos(
+            pos_id="P1", fill_price=123.0, order_type="LOC", bars_held=0, consec_lows=0
+        ))
+        self._update_bars("P1", bars_held=7, consec_lows=3)
+        row = portfolio_state.load_positions()[0]
+        assert row["bars_held"]   == 7
+        assert row["consec_lows"] == 3
+        assert row["fill_price"]  == pytest.approx(123.0)
+        assert row["order_type"]  == "LOC"
+
+    def test_noop_for_unknown_pos_id(self):
+        """UPDATE for a non-existent pos_id must not raise and must not create a row."""
+        self._update_bars("DOES_NOT_EXIST", bars_held=5, consec_lows=1)
+        assert portfolio_state.load_positions() == []
